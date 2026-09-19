@@ -1,7 +1,7 @@
 import Foundation
 
 enum EntryKind: String, Codable {
-    case moved, trashed, duplicate, tagged, simulated, skipped, error
+    case moved, trashed, duplicate, tagged, textLayer, simulated, skipped, error
 }
 
 struct JournalEntry: Codable, Identifiable, Equatable {

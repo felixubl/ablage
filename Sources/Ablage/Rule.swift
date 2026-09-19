@@ -31,6 +31,8 @@ struct Match: Decodable {
     var minAgeDays: Int?
     var minSizeMB: Double?
     var maxSizeMB: Double?
+    /// Lets filename and content terms match with one or two wrong characters, for OCR errors.
+    var fuzzy: Bool?
     /// Hands the decision to a named model once every other criterion matched and no plain rule did.
     var ai: AIMatch?
 
@@ -65,8 +67,76 @@ struct Action: Decodable {
     }
 }
 
+/// One file on its way through the rules: facts plus lazily loaded text and words.
+final class FileContext {
+    let facts: FileFacts
+    private let provider: () -> String?
+    private var loaded = false
+    private var text: String?
+    private var wordCache: Set<String>?
+
+    init(facts: FileFacts, provider: @escaping () -> String?) {
+        self.facts = facts
+        self.provider = provider
+    }
+
+    var content: String? {
+        if !loaded {
+            text = provider()
+            loaded = true
+        }
+        return text
+    }
+
+    var words: Set<String> {
+        if wordCache == nil { wordCache = TextFeatures.rawWords(facts.name + " " + (content ?? "")) }
+        return wordCache ?? []
+    }
+}
+
+enum Fuzzy {
+    static func allowance(_ length: Int) -> Int {
+        length >= 9 ? 2 : (length >= 5 ? 1 : 0)
+    }
+
+    /// Every word of the term has a word in the document within the edit-distance allowance.
+    static func matches(_ term: String, in words: Set<String>) -> Bool {
+        let parts = TextFeatures.rawWords(term)
+        guard !parts.isEmpty else { return false }
+        return parts.allSatisfy { part in
+            if words.contains(part) { return true }
+            let budget = allowance(part.count)
+            guard budget > 0 else { return false }
+            return words.contains { abs($0.count - part.count) <= budget && distance(part, $0, limit: budget) <= budget }
+        }
+    }
+
+    /// Levenshtein distance with an early exit once a row exceeds the limit.
+    static func distance(_ a: String, _ b: String, limit: Int) -> Int {
+        let x = Array(a.unicodeScalars), y = Array(b.unicodeScalars)
+        if x.isEmpty { return y.count }
+        if y.isEmpty { return x.count }
+        var previous = Array(0...y.count)
+        var current = [Int](repeating: 0, count: y.count + 1)
+        for i in 1...x.count {
+            current[0] = i
+            var rowMin = i
+            for j in 1...y.count {
+                let cost = x[i - 1] == y[j - 1] ? 0 : 1
+                current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+                rowMin = min(rowMin, current[j])
+            }
+            if rowMin > limit { return limit + 1 }
+            swap(&previous, &current)
+        }
+        return previous[y.count]
+    }
+}
+
 enum Matcher {
-    static func matches(_ m: Match, _ f: FileFacts, content: () -> String?) -> Bool {
+    static func matches(_ m: Match, _ file: FileContext) -> Bool {
+        let f = file.facts
+        let fuzzy = m.fuzzy == true
         switch m.kind ?? "file" {
         case "file": if f.isFolder { return false }
         case "folder": if !f.isFolder { return false }
@@ -77,7 +147,8 @@ enum Matcher {
             guard wanted.contains(f.ext) else { return false }
         }
         if let parts = m.filename, !parts.isEmpty {
-            guard parts.contains(where: { f.name.localizedCaseInsensitiveContains($0) }) else { return false }
+            let nameWords = TextFeatures.rawWords(f.name)
+            guard parts.contains(where: { f.name.localizedCaseInsensitiveContains($0) || (fuzzy && Fuzzy.matches($0, in: nameWords)) }) else { return false }
         }
         if let re = m.filenameRegex, !re.isEmpty {
             guard Patterns.matches(re, f.name) else { return false }
@@ -89,12 +160,12 @@ enum Matcher {
         if let mb = m.minSizeMB, Double(f.size) < mb * 1_048_576 { return false }
         if let mb = m.maxSizeMB, Double(f.size) > mb * 1_048_576 { return false }
         if m.needsContent {
-            guard let text = content(), !text.isEmpty else { return false }
+            guard let text = file.content, !text.isEmpty else { return false }
             if let any = m.content, !any.isEmpty {
-                guard any.contains(where: { text.localizedCaseInsensitiveContains($0) }) else { return false }
+                guard any.contains(where: { text.localizedCaseInsensitiveContains($0) || (fuzzy && Fuzzy.matches($0, in: file.words)) }) else { return false }
             }
             if let all = m.contentAll, !all.isEmpty {
-                guard all.allSatisfy({ text.localizedCaseInsensitiveContains($0) }) else { return false }
+                guard all.allSatisfy({ text.localizedCaseInsensitiveContains($0) || (fuzzy && Fuzzy.matches($0, in: file.words)) }) else { return false }
             }
             if let re = m.contentRegex, !re.isEmpty {
                 guard Patterns.matches(re, text) else { return false }

@@ -21,7 +21,11 @@ identical file that already sits at the destination is recognised by its checksu
 the Trash instead of becoming `Rechnung_Amazon 2.pdf`.
 
 Files that no rule wants stay in Downloads and appear in the panel. From there you can file
-one with any rule in two clicks, and that is where the learning starts.
+one with any rule in two clicks. Every filing, by rule or by hand, trains a classifier, and
+files that look like something already filed get the same treatment without a rule.
+
+Scanned PDFs get an invisible text layer after filing, so Spotlight and Preview can search
+them. The archive stays a folder tree you can read without Ablage.
 
 ## Install
 
@@ -51,10 +55,13 @@ Files that were already in Downloads before the first launch are left alone. The
 Click the tray icon in the menu bar.
 
 - **Inbox** lists what is waiting, newest first, with what Sort now would do to each file:
-  the rule that would take it, `(learned)` when the learner would, or the model that would be
+  the rule that would take it, `(learned)` when the classifier would, or the model that would be
   asked. Right-click a file for **Apply rule**, **New rule from this file**, **Quick Look**,
   **Reveal in Finder**, **Ask model**, and **Move to Trash**. Double-click opens it. A filter
   field appears when the list gets long.
+- **Review…** opens a table of everything waiting with the same "would" column, for the
+  thousand files that were in Downloads before Ablage. Select rows, or *Select suggested*, then
+  *File selection*, apply one rule to all of them, or trash them. Space is Quick Look.
 - **Drop files onto the panel** to file them by the rules, wherever they come from.
 - **Activity** shows the last moves with the rule, the reason (`learned · like x.pdf (80%)`,
   `via apple: Stadt Wien, Bescheid`), and an **Undo** button. Undo puts the file back and
@@ -71,9 +78,9 @@ Three stages, in this order, and the later ones only run when the earlier ones d
 
 1. **Rules.** Deterministic, written by you, first match wins. This is where almost everything
    should be decided.
-2. **Learned examples.** When you choose *Apply rule* on a file, that file becomes an example
-   for the rule. A later file that looks like one of the examples gets the same rule, marked
-   `(learned)` in the panel. Undoing a learned move records a counterexample.
+2. **The classifier.** Trained on everything that was filed. A file that no rule matched gets
+   the rule the classifier is sure about, marked `(learned)` in the panel with the nearest
+   example it resembles. Undo records a counterexample.
 3. **Models.** Only when a rule explicitly names one. Nothing is sent anywhere otherwise.
 
 ## Rules
@@ -108,6 +115,7 @@ Every criterion in `match` must hold. Lists inside a criterion are alternatives.
 | `contentRegex` | regular expression on the text |
 | `minAgeDays` | days since the file arrived. Rules with this also run on the rescan |
 | `minSizeMB`, `maxSizeMB` | size bounds |
+| `fuzzy` | `true` lets `filename` and `content` terms match with one wrong character (two from nine characters on), for OCR errors |
 | `ai` | `{ "model": "apple", "description": "…" }`, see Models |
 
 | action | meaning |
@@ -130,7 +138,8 @@ matching it. Use it to protect things.
 
 Other keys at the top level: `inbox`, `ignore` (glob patterns), `settleSeconds` (quiet time
 before a file counts as arrived, default 3), `rescanMinutes` (default 30),
-`sortExistingOnRescan`, `notifications`, `ocr`, `ocrPages`, `ocrMaxMB`.
+`sortExistingOnRescan`, `notifications`, `ocr`, `ocrPages`, `ocrMaxMB`, `searchablePDFs`,
+`textLayerMaxPages`, `originalsDays`.
 
 ## Several inboxes
 
@@ -146,19 +155,42 @@ is fine: the file is then handled by that inbox's rules next.
 
 ## Learning
 
-This is paperless-ngx's *auto* matching, kept simple. An example is the set of words in a
-file's name and text plus its extension and download host. A new file is compared with every
-example by cosine similarity over IDF-weighted words, so words that appear in every document
-count for little and words specific to a few count for a lot.
+This is paperless-ngx's *auto* matching. paperless trains a classifier on every document
+that has a correspondent, type or tag assigned, whether a person or a matching rule assigned
+it. Ablage does the same with rules.
 
-A rule needs `minExamples` examples (default 2). The best example must score at least
-`threshold` (default 0.35) and beat any counterexample for that rule. When two rules score
-alike, Ablage does nothing and leaves the file for you. Rules that trash files are never learned.
+**Training data.** Every filing becomes an example: the words of the document, stemmed,
+with stop words removed, plus word pairs, the words of the file name, the extension and the
+download host. A filing you did by hand with *Apply rule* counts at once and weighs three
+times a rule filing. A rule filing counts after `confirmAfterHours` (default 24) have passed
+without an undo, so a wrong rule does not teach anything before you had a chance to see it.
+Undo takes the example back; undoing a learned filing also records a counterexample.
 
-    "learning": { "enabled": true, "minExamples": 2, "threshold": 0.35 }
+**Deciding.** A multinomial naive Bayes classifier over those features gives a probability for
+each rule that has at least `minExamples` examples. The winner needs `minConfidence` (default
+0.8) and a clear margin over the runner-up. On top of that, the document must resemble the
+nearest example of that rule with a cosine similarity of at least `minSimilarity` (default
+0.25), which is what lets the learner say "this looks like nothing I have seen" instead of
+forcing a choice, and it must resemble it more than any counterexample. Rules that trash files
+and rules without an action are never learned.
 
-Examples are stored locally in `learned.json`. The command line can add and inspect them, see
-below.
+    "learning": { "enabled": true, "minExamples": 2, "minConfidence": 0.8, "minSimilarity": 0.25, "fromRules": true, "confirmAfterHours": 24 }
+
+The activity list shows the reason: `learned · like Rechnung_2026-03.pdf (72%), 99% sure`.
+Examples live in `learned.json`; the command line can add, inspect and remove them.
+
+## Searchable PDFs
+
+A scanned PDF is a picture. Spotlight cannot search it, Preview cannot select text in it, and
+Ablage itself has to OCR it every time. After filing, Ablage renders each page, recognises the
+text with Apple's Vision framework, and writes it back into the PDF as invisible text placed
+over the words, the way ocrmypdf does. The page images are re-embedded untouched. From then
+on Spotlight finds the document by its content.
+
+This runs in the background after the move, only for PDFs that have no text layer, and only up
+to `textLayerMaxPages` (default 60) and `ocrMaxMB`. The original bytes are kept under
+Application Support for `originalsDays` (default 30) and Undo restores them. Turn it off with
+`"searchablePDFs": false`. The same thing on demand: `Ablage ocr-layer file.pdf`.
 
 ## Models
 
@@ -214,6 +246,8 @@ The binary inside the bundle doubles as a small CLI for scripts and tests.
     $A examples
     $A add-rule '{ "name": "CSV", "match": { "extensions": ["csv"] }, "action": { "destination": "~/Data" } }'
     $A validate                                 # parse the config and report bad regexes and unknown models
+    $A text ~/Downloads/scan.pdf                # the text Ablage sees, OCR included; --no-ocr for the text layer only
+    $A ocr-layer ~/Downloads/scan.pdf           # add a text layer to a scanned PDF in place
 
 ## Files and privacy
 
@@ -222,6 +256,7 @@ The binary inside the bundle doubles as a small CLI for scripts and tests.
 | config | `~/.config/ablage/config.json` |
 | activity journal | `~/Library/Application Support/Ablage/journal.json` |
 | learned examples | `~/Library/Application Support/Ablage/learned.json` |
+| originals of rewritten PDFs | `~/Library/Application Support/Ablage/originals/`, purged after `originalsDays` |
 | log | `~/Library/Logs/Ablage.log`, kept under a few hundred kilobytes |
 
 Everything runs on the Mac. OCR is Apple's Vision framework, the learner is a few hundred
@@ -238,7 +273,9 @@ which the tests use.
 
 The test builds the binary, starts it against a temporary config with two inboxes, drops
 generated PDFs, a rendered scan and folders into them, and checks moves, renames, tags, OCR,
-the learner, the post-filing script, adding a rule while the app runs, and config validation.
+fuzzy matching, the classifier learning from rule filings and filing an invoice no rule
+matched, the text layer on a scanned PDF, the post-filing script, adding a rule while the app
+runs, and config validation.
 
 Source layout, all under `Sources/Ablage`:
 
@@ -247,17 +284,19 @@ Source layout, all under `Sources/Ablage`:
 | `Engine.swift` | watching, settling, the three filing stages, undo, previews |
 | `Rule.swift` | rule model and deterministic matching |
 | `Extract.swift` | text from PDF, OCR, Office and text files; date recognition |
-| `Learner.swift` | examples and similarity |
+| `Learner.swift` | text features, examples, the classifier |
+| `SearchablePDF.swift` | text layers for scans, kept originals |
 | `AI.swift`, `AppleModel.swift` | model providers |
 | `Config.swift`, `DefaultConfig.swift` | config model, starter config, rule insertion, validation |
-| `Views/` | the panel and the rule editor |
+| `Views/` | the panel, the review table, the rule editor |
 | `CLI.swift` | the command line |
 
 ## What it takes from paperless-ngx
 
 The consumption folder as the one place things arrive. Matching on document content, not just
-names, with *any*, *all* and *regex* modes. Auto matching that learns from what you assign by
-hand. Correspondent, title and date as the parts a filename is built from. Storage paths with
+names, with *any*, *all*, *regex* and *fuzzy* modes. Auto matching: a classifier trained on
+everything that gets filed. OCR that ends up inside the PDF, so the archive is searchable.
+Correspondent, title and date as the parts a filename is built from. Storage paths with
 placeholders. Duplicate detection by checksum. A post-consume script. And the idea that the
 document is the source of truth for its own date.
 

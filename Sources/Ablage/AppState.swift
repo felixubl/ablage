@@ -75,6 +75,10 @@ final class AppState: ObservableObject {
     }
 
     func apply(ruleIndex: Int, to item: InboxItem) { engine.apply(ruleIndex: ruleIndex, to: item.id) }
+    func apply(ruleNamed name: String, to items: [InboxItem]) { engine.apply(ruleNamed: name, paths: items.map(\.id)) }
+    func sort(_ items: [InboxItem]) { engine.sort(paths: items.map(\.id)) }
+    func trash(_ items: [InboxItem]) { engine.trash(paths: items.map(\.id)) }
+    func openReview() { ReviewController.shared.show(state: self) }
     func ask(model: String, _ item: InboxItem) { engine.ask(model: model, path: item.id) }
     func trash(_ item: InboxItem) { engine.trash(path: item.id) }
     func undo(_ entry: JournalEntry) { engine.undo(entry.id) }

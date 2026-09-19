@@ -7,6 +7,7 @@ struct RuleDraft {
     var filename = ""
     var content = ""
     var source = ""
+    var fuzzy = false
     var destination = ""
     var rename = ""
     var dateFromContent = false
@@ -56,6 +57,7 @@ struct RuleDraft {
         if !Self.list(filename).isEmpty { match.append("\"filename\": \(array(Self.list(filename)))") }
         if !Self.list(content).isEmpty { match.append("\"content\": \(array(Self.list(content)))") }
         if !Self.list(source).isEmpty { match.append("\"source\": \(array(Self.list(source)))") }
+        if fuzzy, !Self.list(filename).isEmpty || !Self.list(content).isEmpty { match.append("\"fuzzy\": true") }
 
         var action: [String] = []
         if trash {
@@ -95,6 +97,7 @@ struct RuleEditorView: View {
             field("Filename contains", $draft.filename, "rechnung, invoice")
             field("Text contains", $draft.content, "Rechnungsnummer, Gutschrift")
             field("Downloaded from", $draft.source, "amazon.de")
+            LabeledContent("") { Toggle("Tolerate OCR errors in the words above", isOn: $draft.fuzzy) }
 
             Text("Action").font(.subheadline).foregroundStyle(.secondary)
             LabeledContent("Move to") {
@@ -116,7 +119,7 @@ struct RuleEditorView: View {
             if !excerpt.isEmpty {
                 Text("Document text, for picking keywords").font(.caption).foregroundStyle(.secondary)
                 ScrollView {
-                    Text(excerpt).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    Text(excerpt).font(Fonts.mono()).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .frame(height: 110).padding(6)

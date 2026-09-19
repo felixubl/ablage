@@ -72,6 +72,7 @@ struct PanelView: View {
             HStack {
                 Text(inboxTitle).font(.subheadline).foregroundStyle(.secondary)
                 Spacer()
+                Button("Review…") { state.openReview() }.controlSize(.small).disabled(state.unsortedCount == 0)
                 Button("Sort now…") { state.confirmSortAll() }
                     .controlSize(.small).disabled(state.unsortedCount == 0 || state.progress != nil)
             }
@@ -278,6 +279,7 @@ struct ActivityRow: View {
         case .error: return "failed: \(name)"
         case .skipped: return "no match: \(name)"
         case .tagged: return "tagged \(name)"
+        case .textLayer: return "text layer: \(name)"
         case .duplicate: return "duplicate: \(name)"
         case .trashed: return "trashed \(name)"
         case .moved: return name
@@ -297,6 +299,7 @@ struct ActivityRow: View {
         case .moved: return "arrow.right.doc.on.clipboard"
         case .trashed, .duplicate: return "trash"
         case .tagged: return "tag"
+        case .textLayer: return "doc.text.magnifyingglass"
         case .simulated: return "eye"
         case .skipped: return "questionmark.circle"
         case .error: return "exclamationmark.triangle"

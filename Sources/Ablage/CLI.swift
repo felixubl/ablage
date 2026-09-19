@@ -3,7 +3,7 @@ import Foundation
 /// `Ablage learn <rule> <file>`, `Ablage forget <rule> <file>`, `Ablage suggest <file>`, `Ablage examples`.
 /// The same learning the panel does from Apply rule, usable from scripts and tests.
 enum CLI {
-    static let commands = ["learn", "forget", "suggest", "examples", "add-rule", "validate"]
+    static let commands = ["learn", "forget", "suggest", "examples", "add-rule", "validate", "text", "ocr-layer"]
 
     static func run(_ args: [String]) -> Int32 {
         let learner = Learner()
@@ -31,7 +31,7 @@ enum CLI {
                 learner.forget(rule: args[1], source: f.url.path)
             } else {
                 let text = cache.text(for: f, config: config, allowOCR: true)
-                learner.learn(rule: args[1], facts: f, text: text, positive: !args.contains("--negative"))
+                learner.learn(rule: args[1], facts: f, text: text, weight: 3, positive: !args.contains("--negative"), confirmAfter: nil, entryId: nil)
             }
         case "suggest":
             guard args.count >= 2, let f = facts(args[1]) else {
@@ -41,13 +41,16 @@ enum CLI {
             let text = cache.text(for: f, config: config, allowOCR: true)
             let names = Set(learner.examples.map(\.rule))
             if let s = learner.suggest(facts: f, text: text, among: names, config: config.learning) {
-                print("\(s.rule)\t\(String(format: "%.2f", s.score))\tlike \(s.like)")
+                print("\(s.rule)\tconfidence \(String(format: "%.2f", s.confidence))\tsimilarity \(String(format: "%.2f", s.similarity))\tlike \(s.like)")
             } else {
                 print("no suggestion")
             }
         case "examples":
+            let stamp = DateFormatter()
+            stamp.dateFormat = "dd.MM. HH:mm"
             for e in learner.examples {
-                print("\(e.positive ? "+" : "-")\t\(e.rule)\t\(e.name)\t\(e.tokens.count) tokens")
+                let pending = e.isActive ? "" : "\tpending until \(stamp.string(from: e.confirmAfter ?? Date()))"
+                print("\(e.positive ? "+" : "-")\t\(e.rule)\t\(e.name)\tweight \(e.weight)\t\(e.features.count) features\(pending)")
             }
         case "add-rule":
             guard args.count >= 2 else {
@@ -59,6 +62,33 @@ enum CLI {
                 print("added to \(Paths.abbreviate(Paths.configFile.path))")
             } catch {
                 print("could not add rule: \(error.localizedDescription)")
+                return 1
+            }
+        case "text":
+            let paths = args.dropFirst().filter { !$0.hasPrefix("--") }
+            guard let path = paths.first, let f = facts(path) else {
+                print("usage: Ablage text [--no-ocr] <file>")
+                return 2
+            }
+            guard let text = cache.text(for: f, config: config, allowOCR: !args.contains("--no-ocr")) else {
+                print("no text: unsupported file type")
+                return 1
+            }
+            print(text)
+        case "ocr-layer":
+            guard args.count >= 2, let f = facts(args[1]), f.ext == "pdf" else {
+                print("usage: Ablage ocr-layer <pdf>")
+                return 2
+            }
+            if SearchablePDF.hasTextLayer(f.url) {
+                print("already has a text layer")
+                return 0
+            }
+            do {
+                let pages = try SearchablePDF.addTextLayer(to: f.url, maxPages: config.textLayerMaxPages)
+                print("text layer added on \(pages) page(s)")
+            } catch {
+                print("failed: \(error.localizedDescription)")
                 return 1
             }
         case "validate":
@@ -76,7 +106,7 @@ enum CLI {
                 return 1
             }
         default:
-            print("usage: Ablage learn|forget <rule> <file> | suggest <file> | examples | add-rule '<json>' | validate")
+            print("usage: Ablage learn|forget <rule> <file> | suggest <file> | examples | add-rule '<json>' | validate | text [--no-ocr] <file> | ocr-layer <pdf>")
             return 2
         }
         Log.flush()

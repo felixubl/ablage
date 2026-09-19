@@ -14,15 +14,16 @@ trap cleanup EXIT
 
 cat > "$T/config.json" <<CFG
 {
-  "settleSeconds": 1, "rescanMinutes": 0, "notifications": false,
+  "settleSeconds": 1, "rescanMinutes": 0, "notifications": false, "searchablePDFs": true,
+  "learning": { "minExamples": 2, "confirmAfterHours": 0 },
   "inboxes": [
     { "path": "$T/inbox1", "rules": [ { "name": "Notes", "match": { "extensions": ["txt"] }, "action": { "destination": "Notes", "run": "echo hooked \$ABLAGE_RULE \$ABLAGE_TO >> $T/hook.log" } } ] },
     { "path": "$T/inbox2", "rules": [ { "name": "Notes", "match": { "extensions": ["txt"] }, "action": { "destination": "Notes2" } } ] }
   ],
   "rules": [
-    { "name": "Scan", "match": { "extensions": ["png"], "content": ["Lieferschein"] }, "action": { "destination": "$T/out/Scans", "tags": ["Scan"] } },
+    { "name": "Scan", "match": { "extensions": ["png", "pdf"], "content": ["Wareneingang"] }, "action": { "destination": "$T/out/Scans", "tags": ["Scan"] } },
     { "name": "Screenshots", "match": { "extensions": ["png"], "filenameRegex": "^Screenshot" }, "action": { "destination": "$T/out/Screenshots/{year}" } },
-    { "name": "Rechnungen", "match": { "extensions": ["pdf"], "content": ["Rechnung"] }, "action": { "destination": "$T/out/Finanzen/{year}", "rename": "{date}_{correspondent}", "correspondent": "Test", "dateFrom": "content", "tags": ["Rechnung"] } },
+    { "name": "Rechnungen", "match": { "extensions": ["pdf"], "content": ["Rechnung"], "fuzzy": true }, "action": { "destination": "$T/out/Finanzen/{year}", "rename": "{date}_{correspondent}", "correspondent": "Test", "dateFrom": "content", "tags": ["Rechnung"] } },
     { "name": "Memos", "match": { "extensions": ["md"], "filename": ["memo"] }, "action": { "destination": "$T/out/Memos", "rename": "{date}_memo", "dateFrom": "filename" } },
     { "name": "Keep readme", "match": { "filename": ["readme"] } },
     { "name": "Lieferscheine", "match": { "filename": ["zzz-never"] }, "action": { "destination": "$T/out/Lieferscheine" } },
@@ -46,7 +47,10 @@ def pdf(name, text):
     for o in offs: out += b"%010d 00000 n \n" % o
     out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs)+1, x)
     open(os.path.join(d, name), "wb").write(out)
-pdf("rechnung.pdf", "Rechnung Nr. 4711 Wien, am 15.03.2026 Betrag EUR 120,00 Testfirma GmbH")
+pdf("rechnung.pdf", "Rechnung Nr. 4711 Wien, am 15.03.2026 Betrag EUR 120,00 Testfirma GmbH Zahlbar innerhalb 14 Tagen Kundennummer 8812 UID ATU123 Bankverbindung IBAN Verwendungszweck")
+pdf("rechnung-b.pdf", "Rechnung Nr. 4712 Wien, am 20.04.2026 Betrag EUR 80,00 Testfirma GmbH Zahlbar innerhalb 14 Tagen Kundennummer 8812 UID ATU123 Bankverbindung IBAN Verwendungszweck")
+pdf("faktura.pdf", "Faktura Nr. 4713 Wien, am 02.06.2026 Betrag EUR 95,00 Testfirma GmbH Zahlbar innerhalb 14 Tagen Kundennummer 8812 UID ATU123 Bankverbindung IBAN Verwendungszweck")
+pdf("rechnunq.pdf", "Rechnunq Nr. 9 Wien, am 10.02.2026 Betrag EUR 12,00 Testfirma GmbH")
 pdf("ls-1.pdf", "Lieferschein Nr. 101 vom 02.05.2026 Testfirma GmbH Wien Lieferung Kartons Ware erhalten Unterschrift Spedition Paletten")
 pdf("ls-2.pdf", "Lieferschein Nr. 102 vom 09.06.2026 Testfirma GmbH Wien Lieferung Paletten Ware erhalten Unterschrift Spedition")
 pdf("ls-3.pdf", "Lieferschein Nr. 103 vom 21.07.2026 Testfirma GmbH Wien Lieferung Kartons Ware erhalten Spedition Paletten Unterschrift")
@@ -58,9 +62,11 @@ open(os.path.join(d, "README.md"), "w").write("keep me\n")
 open(os.path.join(d, "20260102_memo.md"), "w").write("memo\n")
 open(os.path.join(d, "data.csv"), "w").write("a,b\n")
 PY
-printf 'LIEFERSCHEIN\n\nLieferschein Nr. 99\nTestfirma GmbH\n' > "$T/stage/scan-src.txt"
+printf 'WARENEINGANG\n\nWareneingang Nr. 99\nTestfirma GmbH\n' > "$T/stage/scan-src.txt"
 qlmanage -t -s 1200 -o "$T/stage" "$T/stage/scan-src.txt" >/dev/null 2>&1
 mv "$T/stage/scan-src.txt.png" "$T/stage/scan.png"; rm "$T/stage/scan-src.txt"
+sips -s format pdf "$T/stage/scan.png" --out "$T/stage/scan.pdf" >/dev/null 2>&1
+mkdir -p "$T/hold"; mv "$T/stage/faktura.pdf" "$T/hold/"
 mkdir -p "$T/stage/oldfolder"; echo x > "$T/stage/oldfolder/x.txt"
 
 echo "learning via CLI"
@@ -78,7 +84,8 @@ sleep 2
 cp -R "$T"/stage/* "$T/inbox1/"; cp "$T/stage/notes.txt" "$T/inbox2/"
 sleep 12
 cp "$T/stage/rechnung.pdf" "$T/inbox1/rechnung-copy.pdf"
-sleep 4
+cp "$T/hold/faktura.pdf" "$T/inbox1/"
+sleep 6
 Y=$(date +%Y); M=$(date +%m)
 check "content match, date and rename" '[ -f "$T/out/Finanzen/2026/2026-03-15_Test.pdf" ]'
 check "finder tag written"             'xattr -p com.apple.metadata:_kMDItemUserTags "$T/out/Finanzen/2026/2026-03-15_Test.pdf" 2>/dev/null | grep -q .'
@@ -89,10 +96,16 @@ check "post-filing script ran"         'grep -q "hooked Notes $T/inbox1/Notes/no
 check "keep rule"                      '[ -f "$T/inbox1/README.md" ]'
 check "date from filename"             '[ -f "$T/out/Memos/2026-01-02_memo.md" ]'
 check "age rule on folder"             '[ -d "$T/inbox1/Archiv/$Y-$M/oldfolder" ]'
-check "learned filing"                 'grep -q "moved \[Lieferscheine\].*like ls-1.pdf" "$T/ablage.log"'
+check "learned filing"                 'grep -q "moved \[Lieferscheine\].*like ls-[12].pdf" "$T/ablage.log"'
 check "second inbox has own rules"     '[ -f "$T/inbox2/Notes2/notes.txt" ]'
 check "duplicate trashed"              'grep -q "^.* duplicate \[Rechnungen\]" "$T/ablage.log"'
 check "unmatched file stays"           '[ -f "$T/inbox1/data.csv" ]'
+check "fuzzy content match"            '[ -f "$T/out/Finanzen/2026/2026-02-10_Test.pdf" ]'
+check "rule filings became examples"   '[ "$(ABLAGE_DIR=$T $BIN examples | grep -c "^+	Rechnungen")" -ge 2 ]'
+check "classifier filed unmatched invoice" '[ -f "$T/out/Finanzen/2026/2026-06-02_Test.pdf" ] && grep -q "moved \[Rechnungen\].*faktura.pdf.*like rechnung" "$T/ablage.log"'
+check "scanned pdf got a text layer"   'ABLAGE_DIR=$T $BIN text --no-ocr "$T/out/Scans/scan.pdf" | grep -qi wareneingang'
+check "original kept for undo"         'ls "$T/originals"/*.pdf >/dev/null 2>&1'
+check "text layer in journal"          'grep -q "textLayer \[Scan\]" "$T/ablage.log"'
 
 echo "adding a rule while running"
 ABLAGE_DIR="$T" $BIN add-rule '{

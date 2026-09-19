@@ -18,6 +18,7 @@ struct InboxItem: Identifiable, Equatable {
     let preview: String?
 
     var url: URL { URL(fileURLWithPath: id) }
+    var hasSuggestion: Bool { preview.map { $0 != "?" && !$0.hasPrefix("AI?:") } ?? false }
 }
 
 struct InboxInfo: Equatable {
@@ -93,6 +94,7 @@ final class Engine {
 
     private let queue = DispatchQueue(label: "at.fubl.ablage.engine", qos: .utility)
     private let previewQueue = DispatchQueue(label: "at.fubl.ablage.preview", qos: .background)
+    private let layerQueue = DispatchQueue(label: "at.fubl.ablage.textlayer", qos: .utility)
     private let fm = FileManager.default
     private let journal = Journal()
     private let learner = Learner()
@@ -138,6 +140,7 @@ final class Engine {
             self.watchConfig()
             self.attachInboxes()
             self.scheduleRescan()
+            Originals.purge(olderThanDays: self.config.originalsDays)
             self.publish()
         }
     }
@@ -248,6 +251,13 @@ final class Engine {
         inboxes.first { $0.holds(path) }
     }
 
+    /// An inbox for a file that lives elsewhere, so dropped files still get the shared rules.
+    private func inboxOrTemporary(for path: String) -> Inbox {
+        inbox(holding: path) ?? Inbox(
+            InboxConfig(path: URL(fileURLWithPath: path).deletingLastPathComponent().path, ignore: nil, rules: nil, sortExistingOnRescan: nil),
+            shared: config.rules, sortExistingDefault: false)
+    }
+
     // MARK: Scanning
 
     private func scheduleScan(_ inbox: Inbox, after delay: TimeInterval) {
@@ -317,24 +327,76 @@ final class Engine {
         publish()
     }
 
+    // MARK: Batch actions
+
     func sortAll() {
         queue.async {
-            let work = self.inboxes.flatMap { inbox in self.list(inbox).filter { inbox.pending[$0.path] == nil }.map { (inbox, $0) } }
-            self.progress = Progress(done: 0, total: work.count)
-            self.publish()
-            for (i, (inbox, url)) in work.enumerated() {
-                inbox.known.insert(url.path)
-                self.process(url: url, in: inbox, mode: .all)
-                self.progress = Progress(done: i + 1, total: work.count)
-                if (i + 1) % 5 == 0 { self.publish() }
+            let work = self.inboxes.flatMap { inbox in self.list(inbox).filter { inbox.pending[$0.path] == nil }.map { $0.path } }
+            self.run(work, label: "sort") { path, inbox in self.process(url: URL(fileURLWithPath: path), in: inbox, mode: .all) }
+        }
+    }
+
+    func sort(paths: [String]) {
+        queue.async {
+            self.run(paths, label: "sort") { path, inbox in self.process(url: URL(fileURLWithPath: path), in: inbox, mode: .all) }
+        }
+    }
+
+    func apply(ruleNamed name: String, paths: [String]) {
+        queue.async {
+            self.run(paths, label: "apply") { path, inbox in
+                guard let rule = inbox.rules.first(where: { $0.name == name }) else {
+                    self.journal.add(JournalEntry(rule: name, kind: .error, from: path, message: "no rule of that name applies to this inbox"))
+                    return
+                }
+                self.process(url: URL(fileURLWithPath: path), in: inbox, mode: .all, forced: rule)
             }
-            self.progress = nil
-            self.schedulePreviews()
+        }
+    }
+
+    func trash(paths: [String]) {
+        queue.async {
+            for path in paths {
+                do {
+                    try self.fm.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)
+                    self.journal.add(JournalEntry(rule: "manual", kind: .trashed, from: path, origin: "manual"))
+                } catch {
+                    self.journal.add(JournalEntry(rule: "manual", kind: .error, from: path, message: error.localizedDescription))
+                }
+            }
             self.publish()
         }
     }
 
-    // MARK: Manual actions
+    /// Files dropped onto the panel. They need not live in an inbox; the shared rules still apply.
+    func file(paths: [String]) {
+        queue.async {
+            self.run(paths, label: "drop") { path, inbox in
+                if !self.process(url: URL(fileURLWithPath: path), in: inbox, mode: .all) {
+                    self.journal.add(JournalEntry(rule: "drop", kind: .skipped, from: path, message: "no rule matched"))
+                }
+            }
+        }
+    }
+
+    /// Runs a step over many files with progress in the panel. On the engine queue.
+    private func run(_ paths: [String], label: String, step: (String, Inbox) -> Void) {
+        let standardized = paths.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        progress = Progress(done: 0, total: standardized.count)
+        publish()
+        for (i, path) in standardized.enumerated() {
+            let inbox = inboxOrTemporary(for: path)
+            inbox.known.insert(path)
+            step(path, inbox)
+            progress = Progress(done: i + 1, total: standardized.count)
+            if (i + 1) % 5 == 0 { publish() }
+        }
+        progress = nil
+        schedulePreviews()
+        publish()
+    }
+
+    // MARK: Single-file actions
 
     func apply(ruleIndex: Int, to path: String) {
         queue.async {
@@ -350,15 +412,13 @@ final class Engine {
     func apply(ruleNamed name: String, to path: String) {
         queue.asyncAfter(deadline: .now() + 1.2) {
             self.reloadConfig()
-            guard let inbox = self.inbox(holding: path), let rule = inbox.rules.first(where: { $0.name == name }) else {
-                self.journal.add(JournalEntry(rule: name, kind: .error, from: path, message: "rule not found after saving, check config.json"))
-                self.publish()
-                return
+            self.run([path], label: "apply") { path, inbox in
+                guard let rule = inbox.rules.first(where: { $0.name == name }) else {
+                    self.journal.add(JournalEntry(rule: name, kind: .error, from: path, message: "rule not found after saving, check config.json"))
+                    return
+                }
+                self.process(url: URL(fileURLWithPath: path), in: inbox, mode: .all, forced: rule)
             }
-            inbox.known.insert(path)
-            self.process(url: URL(fileURLWithPath: path), in: inbox, mode: .all, forced: rule)
-            self.schedulePreviews()
-            self.publish()
         }
     }
 
@@ -368,7 +428,7 @@ final class Engine {
             let facts = FileFacts(url: URL(fileURLWithPath: path))
             var text = ""
             if let facts {
-                let raw = self.contentProvider(for: facts)() ?? ""
+                let raw = self.context(for: facts).content ?? ""
                 text = String(raw.prefix(1500)).replacingOccurrences(of: "[ \\t]+", with: " ", options: .regularExpression)
             }
             DispatchQueue.main.async { completion(facts, text) }
@@ -378,47 +438,19 @@ final class Engine {
     func ask(model: String, path: String) {
         queue.async {
             guard let inbox = self.inbox(holding: path), let facts = FileFacts(url: URL(fileURLWithPath: path)) else { return }
-            let content = self.contentProvider(for: facts)
+            let file = self.context(for: facts)
             inbox.known.insert(path)
-            if self.aiCandidates(facts, rules: inbox.rules, content: content).isEmpty {
+            if self.aiCandidates(file, rules: inbox.rules).isEmpty {
                 self.journal.add(JournalEntry(rule: model, kind: .skipped, from: path, message: "no rule with an ai description applies here"))
             } else {
-                _ = self.askModels(facts, in: inbox, content: content, only: model, manual: true)
+                _ = self.askModels(file, in: inbox, only: model, manual: true)
             }
             self.schedulePreviews()
             self.publish()
         }
     }
 
-    /// Files dropped onto the panel. They need not live in an inbox; the shared rules still apply.
-    func file(paths: [String]) {
-        queue.async {
-            for path in paths {
-                let url = URL(fileURLWithPath: path).standardizedFileURL
-                let inbox = self.inbox(holding: url.path) ?? Inbox(
-                    InboxConfig(path: url.deletingLastPathComponent().path, ignore: nil, rules: nil, sortExistingOnRescan: nil),
-                    shared: self.config.rules, sortExistingDefault: false)
-                inbox.known.insert(url.path)
-                if !self.process(url: url, in: inbox, mode: .all) {
-                    self.journal.add(JournalEntry(rule: "drop", kind: .skipped, from: url.path, message: "no rule matched"))
-                }
-            }
-            self.schedulePreviews()
-            self.publish()
-        }
-    }
-
-    func trash(path: String) {
-        queue.async {
-            do {
-                try self.fm.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)
-                self.journal.add(JournalEntry(rule: "manual", kind: .trashed, from: path, origin: "manual"))
-            } catch {
-                self.journal.add(JournalEntry(rule: "manual", kind: .error, from: path, message: error.localizedDescription))
-            }
-            self.publish()
-        }
-    }
+    func trash(path: String) { trash(paths: [path]) }
 
     func undo(_ id: UUID) {
         queue.async {
@@ -442,7 +474,10 @@ final class Engine {
                 self.inbox(holding: target.path)?.known.insert(target.path)
                 try self.fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try self.fm.moveItem(at: source, to: target)
-                if entry.kind == .moved { Tags.write(entry.previousTags, to: target) }
+                if entry.kind == .moved {
+                    Tags.write(entry.previousTags, to: target)
+                    if Originals.restore(for: id, to: target) { Log.write("undo: original bytes restored for \(target.lastPathComponent)") }
+                }
                 self.journal.markUndone(id)
                 Log.write("undo [\(entry.rule)] \(Paths.abbreviate(source.path)) -> \(Paths.abbreviate(target.path))")
                 self.teachFromUndo(entry, restored: target)
@@ -454,77 +489,73 @@ final class Engine {
         }
     }
 
-    /// Undoing a manual filing forgets the example; undoing a learned one records a counterexample.
+    /// Undoing a filing takes back its example; undoing a learned one also records a counterexample.
     private func teachFromUndo(_ entry: JournalEntry, restored: URL) {
         guard config.learning.enabled else { return }
-        switch entry.origin {
-        case "manual":
-            learner.forget(rule: entry.rule, source: entry.from)
-        case "learned":
-            guard let facts = FileFacts(url: restored) else { return }
-            learner.learn(rule: entry.rule, facts: facts, text: contentProvider(for: facts)(), positive: false)
-        default:
-            break
-        }
+        learner.forget(entryId: entry.id)
+        guard entry.origin == "learned", let facts = FileFacts(url: restored) else { return }
+        learner.learn(rule: entry.rule, facts: facts, text: context(for: facts).content, weight: 1, positive: false, confirmAfter: nil, entryId: entry.id)
     }
 
     // MARK: Processing
 
-    private func contentProvider(for facts: FileFacts) -> () -> String? {
+    private func context(for facts: FileFacts) -> FileContext {
         let config = self.config
         let cache = self.cache
-        return { cache.text(for: facts, config: config, allowOCR: true) }
+        return FileContext(facts: facts) { cache.text(for: facts, config: config, allowOCR: true) }
     }
 
     /// Plain rules first. Then what the user taught. Models only where a rule names one.
     @discardableResult
     private func process(url: URL, in inbox: Inbox, mode: Mode, forced: Rule? = nil) -> Bool {
         guard let facts = FileFacts(url: url) else { return false }
-        let content = contentProvider(for: facts)
+        let file = context(for: facts)
         let rules = inbox.rules
 
         if let forced {
-            if config.learning.enabled, forced.action.trash != true, !forced.action.isNoop || forced.match.ai == nil {
-                learner.learn(rule: forced.name, facts: facts, text: content(), positive: true)
-            }
-            perform(forced, facts, in: inbox, content: content, enrichment: enrichment(for: forced, facts, content: content, manual: true), origin: "manual", note: nil)
+            perform(forced, file, in: inbox, enrichment: enrichment(for: forced, file, manual: true), origin: "manual", note: nil)
             return true
         }
 
         let plain = rules.first { rule in
             guard rule.isEnabled, rule.match.ai == nil else { return false }
             if mode == .ageOnly, rule.match.minAgeDays == nil { return false }
-            return Matcher.matches(rule.match, facts, content: content)
+            return Matcher.matches(rule.match, file)
         }
         if let plain {
-            perform(plain, facts, in: inbox, content: content, enrichment: enrichment(for: plain, facts, content: content, manual: false), origin: "rule", note: nil)
+            perform(plain, file, in: inbox, enrichment: enrichment(for: plain, file, manual: false), origin: "rule", note: nil)
             return true
         }
         guard mode != .ageOnly else { return false }
 
-        if let suggestion = learnedSuggestion(facts, rules: rules, content: content),
-           let rule = rules.first(where: { $0.name == suggestion.rule }) {
-            let note = "like \(suggestion.like) (\(Int(suggestion.score * 100))%)"
-            perform(rule, facts, in: inbox, content: content, enrichment: nil, origin: "learned", note: note)
+        if let suggestion = learnedSuggestion(file, rules: rules), let rule = rules.first(where: { $0.name == suggestion.rule }) {
+            var note = "like \(suggestion.like) (\(Int(suggestion.similarity * 100))%)"
+            if suggestion.confidence < 1 { note += ", \(Int(suggestion.confidence * 100))% sure" }
+            perform(rule, file, in: inbox, enrichment: nil, origin: "learned", note: note)
             return true
         }
-        return askModels(facts, in: inbox, content: content, only: nil, manual: false)
+        return askModels(file, in: inbox, only: nil, manual: false)
     }
 
-    private func learnedSuggestion(_ facts: FileFacts, rules: [Rule], content: () -> String?) -> Suggestion? {
+    private func learnableRules(_ rules: [Rule]) -> Set<String> {
+        Set(rules.filter { $0.isEnabled && $0.match.ai == nil && $0.action.trash != true && !$0.action.isNoop }.map(\.name))
+    }
+
+    private func learnedSuggestion(_ file: FileContext, rules: [Rule]) -> Suggestion? {
         guard config.learning.enabled else { return nil }
-        let names = Set(rules.filter { $0.isEnabled && $0.match.ai == nil && $0.action.trash != true }.map(\.name))
+        let names = learnableRules(rules)
         guard !names.isEmpty, learner.examples.contains(where: { names.contains($0.rule) }) else { return nil }
-        return learner.suggest(facts: facts, text: content(), among: names, config: config.learning)
+        return learner.suggest(facts: file.facts, text: file.content, among: names, config: config.learning)
     }
 
-    private func aiCandidates(_ facts: FileFacts, rules: [Rule], content: () -> String?) -> [Rule] {
-        rules.filter { $0.isEnabled && $0.match.ai != nil && Matcher.matches($0.match, facts, content: content) }
+    private func aiCandidates(_ file: FileContext, rules: [Rule]) -> [Rule] {
+        rules.filter { $0.isEnabled && $0.match.ai != nil && Matcher.matches($0.match, file) }
     }
 
     /// Remote models wait for a manual request unless marked automatic.
-    private func askModels(_ facts: FileFacts, in inbox: Inbox, content: () -> String?, only: String?, manual: Bool) -> Bool {
-        let candidates = aiCandidates(facts, rules: inbox.rules, content: content)
+    private func askModels(_ file: FileContext, in inbox: Inbox, only: String?, manual: Bool) -> Bool {
+        let facts = file.facts
+        let candidates = aiCandidates(file, rules: inbox.rules)
         guard !candidates.isEmpty else { return false }
         var models: [String] = []
         if let only {
@@ -544,12 +575,12 @@ final class Engine {
                 continue
             }
             let pool = only == nil ? candidates.filter { $0.match.ai?.model == name } : candidates
-            guard let result = classifier.classify(facts: facts, text: content(), candidates: pool, model: name) else {
+            guard let result = classifier.classify(facts: facts, text: file.content, candidates: pool, model: name) else {
                 if manual { journal.add(JournalEntry(rule: name, kind: .skipped, from: facts.url.path, message: "no answer, see log")) }
                 continue
             }
             if (1...pool.count).contains(result.category) {
-                perform(pool[result.category - 1], facts, in: inbox, content: content, enrichment: result, origin: "model:\(name)", note: nil)
+                perform(pool[result.category - 1], file, in: inbox, enrichment: result, origin: "model:\(name)", note: nil)
                 return true
             }
             if manual { journal.add(JournalEntry(rule: name, kind: .skipped, from: facts.url.path, message: "no category fits")) }
@@ -557,26 +588,27 @@ final class Engine {
         return false
     }
 
-    private func enrichment(for rule: Rule, _ facts: FileFacts, content: () -> String?, manual: Bool) -> Classification? {
+    private func enrichment(for rule: Rule, _ file: FileContext, manual: Bool) -> Classification? {
         guard let name = rule.action.ai else { return nil }
         guard let model = config.ai.models[name] else {
             Log.write("ai: model \"\(name)\" is not defined under ai.models")
             return nil
         }
         guard manual || model.runsAutomatically else {
-            Log.write("ai: \(name) is remote and not automatic, no enrichment for \(facts.name)")
+            Log.write("ai: \(name) is remote and not automatic, no enrichment for \(file.facts.name)")
             return nil
         }
-        return classifier.classify(facts: facts, text: content(), candidates: [], model: name)
+        return classifier.classify(facts: file.facts, text: file.content, candidates: [], model: name)
     }
 
-    private func perform(_ rule: Rule, _ facts: FileFacts, in inbox: Inbox, content: () -> String?, enrichment: Classification?, origin: String, note: String?) {
+    private func perform(_ rule: Rule, _ file: FileContext, in inbox: Inbox, enrichment: Classification?, origin: String, note: String?) {
+        let facts = file.facts
         let action = rule.action
         var date = facts.modified
         if action.usesDate {
             switch action.dateFrom ?? (enrichment != nil ? "content" : "file") {
             case "content":
-                date = enrichment?.date ?? content().flatMap(Extract.date) ?? Extract.date(in: facts.stem) ?? facts.modified
+                date = enrichment?.date ?? file.content.flatMap(Extract.date) ?? Extract.date(in: facts.stem) ?? facts.modified
             case "filename":
                 date = Extract.date(in: facts.stem) ?? facts.modified
             default:
@@ -642,6 +674,8 @@ final class Engine {
             journal.add(JournalEntry(rule: rule.name, kind: .simulated, from: facts.url.path, to: target.path, message: message, origin: origin))
             return
         }
+        // Features are read before the move, while the file is still where the facts say.
+        let learnText = config.learning.enabled ? file.content : nil
         do {
             try fm.createDirectory(at: folder, withIntermediateDirectories: true)
             if fm.fileExists(atPath: target.path) {
@@ -657,11 +691,47 @@ final class Engine {
             }
             try fm.moveItem(at: facts.url, to: target)
             if !newTags.isEmpty { Tags.write(previousTags + newTags, to: target) }
-            journal.add(JournalEntry(rule: rule.name, kind: .moved, from: facts.url.path, to: target.path, message: message, origin: origin, previousTags: previousTags))
+            let entry = JournalEntry(rule: rule.name, kind: .moved, from: facts.url.path, to: target.path, message: message, origin: origin, previousTags: previousTags)
+            journal.add(entry)
+            remember(rule, facts, text: learnText, origin: origin, entryId: entry.id)
             notify(rule.name, "\(facts.name) → \(Paths.abbreviate(folder.path))", path: target.path)
             if let command = action.run { runHook(command, rule: rule.name, from: facts.url.path, to: target.path) }
+            scheduleTextLayer(for: target, entryId: entry.id, rule: rule.name)
         } catch {
             journal.add(JournalEntry(rule: rule.name, kind: .error, from: facts.url.path, to: target.path, message: error.localizedDescription))
+        }
+    }
+
+    /// Every filing is training data. Hand filings count at once and weigh more; rule filings count
+    /// after the confirmation period, so an undo can still take them back.
+    private func remember(_ rule: Rule, _ facts: FileFacts, text: String?, origin: String, entryId: UUID) {
+        guard config.learning.enabled, rule.action.trash != true, rule.match.ai == nil else { return }
+        let manual = origin == "manual"
+        guard manual || config.learning.fromRules else { return }
+        let confirmAfter = manual ? nil : Date().addingTimeInterval(config.learning.confirmAfterHours * 3600)
+        let weight = manual ? 3.0 : (origin == "rule" ? 1.0 : 0.5)
+        learner.learn(rule: rule.name, facts: facts, text: text, weight: weight, positive: true, confirmAfter: confirmAfter, entryId: entryId)
+    }
+
+    /// Scans get a text layer after filing, in the background. The original bytes are kept for Undo.
+    private func scheduleTextLayer(for url: URL, entryId: UUID, rule: String) {
+        guard config.searchablePDFs, url.pathExtension.lowercased() == "pdf" else { return }
+        let maxPages = config.textLayerMaxPages
+        let maxBytes = Int64(config.ocrMaxMB * 1_048_576)
+        layerQueue.async { [weak self] in
+            guard let self else { return }
+            guard let size = (try? self.fm.attributesOfItem(atPath: url.path))?[.size] as? NSNumber, size.int64Value <= maxBytes else { return }
+            guard !SearchablePDF.hasTextLayer(url) else { return }
+            do {
+                try Originals.keep(url, for: entryId)
+                let pages = try SearchablePDF.addTextLayer(to: url, maxPages: maxPages)
+                self.queue.async {
+                    self.journal.add(JournalEntry(rule: rule, kind: .textLayer, from: url.path, to: url.path, message: "searchable now, \(pages) page\(pages == 1 ? "" : "s") of text", origin: "rule"))
+                    self.publish()
+                }
+            } catch {
+                Log.write("text layer: \(url.lastPathComponent): \(error.localizedDescription)")
+            }
         }
     }
 
@@ -709,6 +779,7 @@ final class Engine {
         let learner = self.learner
         for inbox in inboxes {
             let rules = inbox.rules.filter(\.isEnabled)
+            let learnable = learnableRules(rules)
             for url in list(inbox) where inbox.known.contains(url.path) && inbox.pending[url.path] == nil {
                 guard let facts = FileFacts(url: url) else { continue }
                 let key = cache.key(for: facts)
@@ -716,13 +787,13 @@ final class Engine {
                 previewInFlight.insert(key)
                 previewQueue.async { [weak self] in
                     guard let self else { return }
-                    let content: () -> String? = { self.cache.text(for: facts, config: config, allowOCR: false) }
-                    var name = rules.first { $0.match.ai == nil && Matcher.matches($0.match, facts, content: content) }?.name ?? ""
-                    if name.isEmpty, config.learning.enabled {
-                        let names = Set(rules.filter { $0.match.ai == nil && $0.action.trash != true }.map(\.name))
-                        if let s = learner.suggest(facts: facts, text: content(), among: names, config: config.learning) { name = "learned:\(s.rule)" }
+                    let file = FileContext(facts: facts) { self.cache.text(for: facts, config: config, allowOCR: false) }
+                    var name = rules.first { $0.match.ai == nil && Matcher.matches($0.match, file) }?.name ?? ""
+                    if name.isEmpty, config.learning.enabled, !learnable.isEmpty,
+                       let s = learner.suggest(facts: facts, text: file.content, among: learnable, config: config.learning) {
+                        name = "learned:\(s.rule)"
                     }
-                    if name.isEmpty, let model = rules.first(where: { $0.match.ai != nil && Matcher.matches($0.match, facts, content: content) })?.match.ai?.model {
+                    if name.isEmpty, let model = rules.first(where: { $0.match.ai != nil && Matcher.matches($0.match, file) })?.match.ai?.model {
                         name = (config.ai.models[model]?.runsAutomatically ?? false) ? "AI:\(model)" : "AI?:\(model)"
                     }
                     if name.isEmpty, self.cache.ocrPending(key) { name = "?" }

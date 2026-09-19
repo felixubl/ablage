@@ -29,10 +29,18 @@ struct InboxConfig: Decodable {
 
 struct LearnConfig: Decodable {
     var enabled = true
+    /// Positive examples a rule needs before the learner may pick it.
     var minExamples = 2
-    var threshold = 0.35
+    /// Classifier posterior the winning rule needs when more than one rule is in the running.
+    var minConfidence = 0.8
+    /// Cosine similarity to the nearest example of that rule. Rejects documents unlike anything seen.
+    var minSimilarity = 0.25
+    /// Also learn from rule filings, not only from Apply rule.
+    var fromRules = true
+    /// Hours a rule filing must survive without an undo before it counts.
+    var confirmAfterHours = 24.0
 
-    private enum CodingKeys: String, CodingKey { case enabled, minExamples, threshold }
+    private enum CodingKeys: String, CodingKey { case enabled, minExamples, minConfidence, minSimilarity, threshold, fromRules, confirmAfterHours }
 
     init() {}
 
@@ -40,7 +48,11 @@ struct LearnConfig: Decodable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? enabled
         minExamples = try c.decodeIfPresent(Int.self, forKey: .minExamples) ?? minExamples
-        threshold = try c.decodeIfPresent(Double.self, forKey: .threshold) ?? threshold
+        minConfidence = try c.decodeIfPresent(Double.self, forKey: .minConfidence) ?? minConfidence
+        minSimilarity = try c.decodeIfPresent(Double.self, forKey: .minSimilarity)
+            ?? c.decodeIfPresent(Double.self, forKey: .threshold) ?? minSimilarity
+        fromRules = try c.decodeIfPresent(Bool.self, forKey: .fromRules) ?? fromRules
+        confirmAfterHours = try c.decodeIfPresent(Double.self, forKey: .confirmAfterHours) ?? confirmAfterHours
     }
 }
 
@@ -55,6 +67,10 @@ struct Config: Decodable {
     var ocr = true
     var ocrPages = 2
     var ocrMaxMB = 25.0
+    /// Give scanned PDFs an invisible text layer after filing, so Spotlight can search them.
+    var searchablePDFs = true
+    var textLayerMaxPages = 60
+    var originalsDays = 30
     var ai = AIConfig()
     var learning = LearnConfig()
     var rules: [Rule] = []
@@ -66,7 +82,7 @@ struct Config: Decodable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case inbox, inboxes, ignore, settleSeconds, rescanMinutes, sortExistingOnRescan, notifications, ocr, ocrPages, ocrMaxMB, ai, learning, rules
+        case inbox, inboxes, ignore, settleSeconds, rescanMinutes, sortExistingOnRescan, notifications, ocr, ocrPages, ocrMaxMB, searchablePDFs, textLayerMaxPages, originalsDays, ai, learning, rules
     }
 
     init() {}
@@ -83,6 +99,9 @@ struct Config: Decodable {
         ocr = try c.decodeIfPresent(Bool.self, forKey: .ocr) ?? ocr
         ocrPages = try c.decodeIfPresent(Int.self, forKey: .ocrPages) ?? ocrPages
         ocrMaxMB = try c.decodeIfPresent(Double.self, forKey: .ocrMaxMB) ?? ocrMaxMB
+        searchablePDFs = try c.decodeIfPresent(Bool.self, forKey: .searchablePDFs) ?? searchablePDFs
+        textLayerMaxPages = try c.decodeIfPresent(Int.self, forKey: .textLayerMaxPages) ?? textLayerMaxPages
+        originalsDays = try c.decodeIfPresent(Int.self, forKey: .originalsDays) ?? originalsDays
         ai = try c.decodeIfPresent(AIConfig.self, forKey: .ai) ?? ai
         learning = try c.decodeIfPresent(LearnConfig.self, forKey: .learning) ?? learning
         rules = try c.decodeIfPresent([Rule].self, forKey: .rules) ?? rules
