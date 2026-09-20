@@ -1,6 +1,12 @@
 APP = Ablage
 BIN = .build/release/$(APP)
 BUNDLE = dist/$(APP).app
+# A real signing identity keeps the same designated requirement across builds, so macOS keeps
+# folder and notification permissions. Ad hoc signatures change with every build and lose them.
+SIGN_ID ?= $(shell security find-identity -v -p codesigning 2>/dev/null | grep -o '"Apple Development: [^"]*"' | head -1)
+ifeq ($(SIGN_ID),)
+SIGN_ID = -
+endif
 
 .PHONY: build app install run clean
 
@@ -13,7 +19,7 @@ app: build
 	cp $(BIN) $(BUNDLE)/Contents/MacOS/$(APP)
 	cp Resources/Info.plist $(BUNDLE)/Contents/Info.plist
 	cp Resources/AppIcon.icns $(BUNDLE)/Contents/Resources/AppIcon.icns
-	codesign --force --sign - $(BUNDLE)
+	codesign --force --timestamp=none --sign $(SIGN_ID) $(BUNDLE)
 
 install: app
 	pkill -x $(APP) || true
