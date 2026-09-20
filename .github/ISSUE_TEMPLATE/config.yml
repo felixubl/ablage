@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/felixubl/ablage/security/advisories/new
+    about: Report a vulnerability privately.
+  - name: Setup and troubleshooting
+    url: https://github.com/felixubl/ablage/tree/main/docs
+    about: Read the guides before opening an issue.

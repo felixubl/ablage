@@ -14,17 +14,20 @@ struct InboxItem: Identifiable, Equatable {
     let ageDays: Int
     let added: Date
     let status: ItemStatus
-    /// What Sort now would do: a rule name, "learned:<rule>", "AI:<model>", "AI?:<model>" or "?" for files that need OCR.
-    let preview: String?
+    let preview: FilePlan?
 
     var url: URL { URL(fileURLWithPath: id) }
-    var hasSuggestion: Bool { preview.map { $0 != "?" && !$0.hasPrefix("AI?:") } ?? false }
+    var plan: FilePlan { status == .settling ? .arriving : (preview ?? .checking) }
+    var hasSuggestion: Bool { plan.hasAction }
+
 }
 
 struct InboxInfo: Equatable {
     var label: String
     var path: String
     var ruleNames: [String]
+    var enabled: Bool
+    var reviewFirst = false
 }
 
 struct Progress: Equatable {
@@ -60,7 +63,10 @@ final class Engine {
         let ignore: [String]
         let rules: [Rule]
         let sortExistingOnRescan: Bool
+        let enabled: Bool
+        let reviewFirst: Bool
         let excludedFolders: Set<String>
+        var accessError: String?
         var watcher: FolderWatcher?
         var scanWork: DispatchWorkItem?
         var known = Set<String>()
@@ -68,12 +74,14 @@ final class Engine {
         /// Arrivals during a pause. Sorted when the pause ends.
         var heldBack = Set<String>()
 
-        init(_ config: InboxConfig, shared: [Rule], sortExistingDefault: Bool) {
+        init(_ config: InboxConfig, shared: [Rule], sortExistingDefault: Bool, sharedIgnore: [String] = []) {
             let base = URL(fileURLWithPath: Paths.expand(config.path), isDirectory: true).standardizedFileURL
             let all = (config.rules ?? []) + shared
             url = base
-            label = Paths.abbreviate(base.path)
-            ignore = config.ignore ?? []
+            label = config.name.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 } ?? base.lastPathComponent
+            enabled = config.enabled ?? true
+            reviewFirst = config.reviewFirst ?? false
+            ignore = sharedIgnore + (config.ignore ?? [])
             rules = all
             sortExistingOnRescan = config.sortExistingOnRescan ?? sortExistingDefault
             excludedFolders = Set(all.compactMap { rule -> String? in
@@ -94,7 +102,9 @@ final class Engine {
 
     private let queue = DispatchQueue(label: "at.fubl.ablage.engine", qos: .utility)
     private let previewQueue = DispatchQueue(label: "at.fubl.ablage.preview", qos: .background)
+    private let recognitionQueue = DispatchQueue(label: "at.fubl.ablage.recognition", qos: .background)
     private let layerQueue = DispatchQueue(label: "at.fubl.ablage.textlayer", qos: .utility)
+    private let archiveQueue = DispatchQueue(label: "at.fubl.ablage.archive.filings", qos: .utility)
     private let fm = FileManager.default
     private let journal = Journal()
     private let learner = Learner()
@@ -110,23 +120,30 @@ final class Engine {
     private var configWork: DispatchWorkItem?
     private var publishWork: DispatchWorkItem?
     private var rescanTimer: DispatchSourceTimer?
-    private var previews = [String: String]()
+    private var previewGeneration = 0
+    private var previewRevisions = [String: Int]()
+    private var previews = [String: FilePlan]()
     private var previewInFlight = Set<String>()
+    private var recognitionPending = [String: FileFacts]()
+    private var recognitionOrder: [String] = []
+    private var recognitionActive: String?
     private var progress: Progress?
+    private let cancelLock = NSLock()
+    private var batchCancelled = false
 
     var onUpdate: ((Snapshot) -> Void)?
 
     /// Simulation is on until the user turns it off once, so a fresh install never moves anything unseen.
     var simulate: Bool {
-        get { defaults.object(forKey: Self.simulateKey) as? Bool ?? true }
+        get { ProcessInfo.processInfo.environment["ABLAGE_SIMULATE"].map { $0 != "0" } ?? (defaults.object(forKey: Self.simulateKey) as? Bool ?? true) }
         set { defaults.set(newValue, forKey: Self.simulateKey) }
     }
 
     var paused: Bool {
-        get { defaults.bool(forKey: Self.pausedKey) }
+        get { ProcessInfo.processInfo.environment["ABLAGE_PAUSED"].map { $0 == "1" } ?? defaults.bool(forKey: Self.pausedKey) }
         set {
             defaults.set(newValue, forKey: Self.pausedKey)
-            if !newValue { queue.async { self.inboxes.forEach { self.scheduleScan($0, after: 0) } } }
+            if !newValue { queue.async { self.inboxes.forEach { self.scheduleScan($0, after: 0) }; self.startRecognition() } }
         }
     }
 
@@ -140,7 +157,7 @@ final class Engine {
             self.watchConfig()
             self.attachInboxes()
             self.scheduleRescan()
-            Originals.purge(olderThanDays: self.config.originalsDays)
+            if !self.config.keepOriginalsForever { Originals.purge(olderThanDays: self.config.originalsDays) }
             self.publish()
         }
     }
@@ -157,19 +174,18 @@ final class Engine {
         loadedStamp = configStamp()
         do {
             try ConfigStore.ensureDefault()
-            config = try ConfigStore.load()
+            let candidate = try ConfigStore.load()
+            let issues = ConfigStore.problems(in: candidate)
+            guard issues.isEmpty else { throw ConfigError(message: issues.joined(separator: "\n")) }
+            config = candidate
             configError = nil
             Log.write("config loaded: \(config.rules.count) shared rules, \(config.resolvedInboxes.count) inbox(es)")
-            let problems = ConfigStore.problems(in: config)
-            if !problems.isEmpty {
-                configError = problems.joined(separator: "\n")
-                Log.write("config problems: \(problems.joined(separator: "; "))")
-            }
         } catch {
             configError = "config.json: \(ConfigStore.describe(error))"
             Log.write("config error: \(error)")
         }
         classifier = Classifier(config: config.ai)
+        MailIngestor.shared.configure(config.mailAccounts)
     }
 
     private func watchConfig() {
@@ -186,15 +202,20 @@ final class Engine {
     private func reloadConfig() {
         guard configStamp() != loadedStamp else { return }
         loadConfig()
+        previewGeneration += 1
         previews.removeAll()
+        previewInFlight.removeAll()
+        recognitionPending.removeAll()
+        recognitionOrder.removeAll()
         attachInboxes()
         scheduleRescan()
         publish()
     }
 
     private func attachInboxes() {
+        let previous = Dictionary(uniqueKeysWithValues: inboxes.map { ($0.url.path, $0) })
         for inbox in inboxes { inbox.scanWork?.cancel() }
-        inboxes = config.resolvedInboxes.map { Inbox($0, shared: config.rules, sortExistingDefault: config.sortExistingOnRescan) }
+        inboxes = config.resolvedInboxes.map { Inbox($0, shared: config.rules, sortExistingDefault: config.sortExistingOnRescan, sharedIgnore: config.ignore) }
         var missing: [String] = []
         for inbox in inboxes {
             var isDirectory: ObjCBool = false
@@ -207,7 +228,14 @@ final class Engine {
                 self.scheduleScan(inbox, after: 1.0)
             }
             // Files already there are content, not arrivals. They wait for Sort now or an age rule.
-            for url in list(inbox) { inbox.known.insert(url.path) }
+            if let old = previous[inbox.url.path] {
+                inbox.known = old.known
+                inbox.pending = old.pending
+                inbox.heldBack = old.heldBack
+                scheduleScan(inbox, after: 0.1)
+            } else {
+                for url in list(inbox) { inbox.known.insert(url.path) }
+            }
         }
         if !missing.isEmpty, configError == nil { configError = "inbox folder not found: \(missing.joined(separator: ", "))" }
         schedulePreviews()
@@ -229,7 +257,12 @@ final class Engine {
 
     private func list(_ inbox: Inbox) -> [URL] {
         let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey]
-        guard let urls = try? fm.contentsOfDirectory(at: inbox.url, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) else {
+        let urls: [URL]
+        do {
+            urls = try fm.contentsOfDirectory(at: inbox.url, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])
+            inbox.accessError = nil
+        } catch {
+            inbox.accessError = "Could not read \(inbox.label): \(error.localizedDescription)"
             return []
         }
         return urls.filter { url in
@@ -302,7 +335,7 @@ final class Engine {
             inbox.pending.removeValue(forKey: url.path)
             inbox.known.insert(url.path)
         }
-        if paused {
+        if paused || !inbox.enabled {
             for url in settled { inbox.heldBack.insert(url.path) }
         } else {
             let resumed = inbox.heldBack.filter { current.contains($0) }
@@ -317,7 +350,7 @@ final class Engine {
 
     private func rescan() {
         guard !paused else { return }
-        for inbox in inboxes {
+        for inbox in inboxes where inbox.enabled && !inbox.reviewFirst {
             let mode: Mode = inbox.sortExistingOnRescan ? .all : .ageOnly
             for url in list(inbox) where inbox.known.contains(url.path) && inbox.pending[url.path] == nil {
                 process(url: url, in: inbox, mode: mode)
@@ -329,9 +362,21 @@ final class Engine {
 
     // MARK: Batch actions
 
+    func cancelCurrentBatch() {
+        cancelLock.lock()
+        batchCancelled = true
+        cancelLock.unlock()
+    }
+
+    private func isBatchCancelled() -> Bool {
+        cancelLock.lock()
+        defer { cancelLock.unlock() }
+        return batchCancelled
+    }
+
     func sortAll() {
         queue.async {
-            let work = self.inboxes.flatMap { inbox in self.list(inbox).filter { inbox.pending[$0.path] == nil }.map { $0.path } }
+            let work = self.inboxes.flatMap { inbox in self.list(inbox).filter { inbox.known.contains($0.path) && inbox.pending[$0.path] == nil }.map { $0.path } }
             self.run(work, label: "sort") { path, inbox in self.process(url: URL(fileURLWithPath: path), in: inbox, mode: .all) }
         }
     }
@@ -354,17 +399,66 @@ final class Engine {
         }
     }
 
-    func trash(paths: [String]) {
+    func trash(paths: [String], requiring digests: [String: String] = [:]) {
         queue.async {
             for path in paths {
                 do {
-                    try self.fm.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)
-                    self.journal.add(JournalEntry(rule: "manual", kind: .trashed, from: path, origin: "manual"))
+                    guard digests.allSatisfy({ Hashing.digest(URL(fileURLWithPath: $0.key))?.hex == $0.value }) else {
+                        throw ConfigError(message: "A compared document changed or disappeared. Refresh the archive and compare both copies again.")
+                    }
+                    if self.simulate {
+                        self.journal.add(JournalEntry(rule: "manual", kind: .simulated, from: path, message: "would move to Trash", origin: "manual"))
+                        continue
+                    }
+                    var trashed: NSURL?
+                    try self.fm.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: &trashed)
+                    if let target = trashed?.path { try? DocumentLibrary.shared.retire(path, trash: target) }
+                    self.journal.add(JournalEntry(rule: "manual", kind: .trashed, from: path, trashPath: trashed?.path, origin: "manual"))
                 } catch {
                     self.journal.add(JournalEntry(rule: "manual", kind: .error, from: path, message: error.localizedDescription))
                 }
             }
             self.publish()
+            DispatchQueue.main.async { NotificationCenter.default.post(name: .ablageArchiveChanged, object: nil) }
+        }
+    }
+
+    /// An explicit duplicate review always retains a revalidated copy and records Undo information.
+    func trashDuplicates(_ request: DuplicateRemoval, completion: @escaping (DuplicateRemovalResult) -> Void) {
+        queue.async {
+            var result = DuplicateRemovalResult()
+            let preview = self.simulate
+            do {
+                try request.validate()
+                for copy in request.copies {
+                    // Recheck the retained copy before each removal, including after a previous copy moved.
+                    guard try ExactDuplicateScanner.digest(request.keeper) == request.digest,
+                          try ExactDuplicateScanner.digest(copy) == request.digest else {
+                        throw ConfigError(message: "A compared file changed. Remaining copies were left in place; scan again.")
+                    }
+                    if preview {
+                        self.journal.add(JournalEntry(rule: "Duplicate finder", kind: .simulated, from: copy.path,
+                                                      message: "would move identical copy to Trash; keep " + Paths.abbreviate(request.keeper.path), origin: "manual"))
+                        result.previewed += 1
+                    } else {
+                        var trashed: NSURL?
+                        try self.fm.trashItem(at: copy.url, resultingItemURL: &trashed)
+                        if let target = trashed?.path { try? DocumentLibrary.shared.retire(copy.path, trash: target) }
+                        self.journal.add(JournalEntry(rule: "Duplicate finder", kind: .trashed, from: copy.path,
+                                                      trashPath: trashed?.path, message: "Identical copy retained at " + Paths.abbreviate(request.keeper.path), origin: "manual"))
+                        result.removedPaths.append(copy.path)
+                    }
+                }
+            } catch {
+                result.error = error.localizedDescription
+                self.journal.add(JournalEntry(rule: "Duplicate finder", kind: .error, from: request.keeper.path, message: error.localizedDescription))
+            }
+            self.publish()
+            let finished = result
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .ablageArchiveChanged, object: nil)
+                completion(finished)
+            }
         }
     }
 
@@ -381,10 +475,14 @@ final class Engine {
 
     /// Runs a step over many files with progress in the panel. On the engine queue.
     private func run(_ paths: [String], label: String, step: (String, Inbox) -> Void) {
+        cancelLock.lock()
+        batchCancelled = false
+        cancelLock.unlock()
         let standardized = paths.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
         progress = Progress(done: 0, total: standardized.count)
         publish()
         for (i, path) in standardized.enumerated() {
+            if isBatchCancelled() { Log.write("\(label): stopped after \(i) of \(standardized.count) files"); break }
             let inbox = inboxOrTemporary(for: path)
             inbox.known.insert(path)
             step(path, inbox)
@@ -397,6 +495,93 @@ final class Engine {
     }
 
     // MARK: Single-file actions
+
+    func reviewDocument(path: String, completion: @escaping (Result<DocumentReviewPacket, Error>) -> Void) {
+        queue.async {
+            do {
+                let url = URL(fileURLWithPath: path)
+                guard let facts = FileFacts(url: url), !facts.isFolder, let digest = Hashing.digest(url)?.hex else { throw ConfigError(message: "This document is unavailable.") }
+                let inbox = self.inboxOrTemporary(for: path)
+                let file = self.context(for: facts)
+                let text = file.content ?? ""
+                let plan = FilePlan.evaluate(rules: inbox.rules, file: file, inbox: inbox.url, config: self.config, ocrPending: { false }, textFailure: { self.cache.failure(self.cache.key(for: facts, config: self.config)) }, learned: { self.learnedSuggestion(file, rules: inbox.rules) })
+                self.refreshPreview(for: facts)
+                var metadata = try DocumentLibrary.shared.metadata(for: path) ?? DocumentMetadata.suggestions(name: facts.name, text: text)
+                if let rule = inbox.rules.first(where: { $0.name == plan.rule }) {
+                    let context = rule.templateContext(for: file, enrichment: nil)
+                    if metadata.correspondent.isEmpty { metadata.correspondent = context.correspondent }
+                    if metadata.documentDate.isEmpty { metadata.documentDate = DocumentMetadata.dateString(context.date) }
+                }
+                guard Hashing.digest(url)?.hex == digest else { throw ConfigError(message: "The document changed while loading. Open review again.") }
+                let packet = DocumentReviewPacket(facts: facts, text: text, metadata: metadata, rules: inbox.rules, inbox: inbox.url, config: self.config, plan: plan, digest: digest)
+                DispatchQueue.main.async { completion(.success(packet)) }
+            } catch { DispatchQueue.main.async { completion(.failure(error)) } }
+        }
+    }
+
+    func approve(_ packet: DocumentReviewPacket, draft: DocumentReviewDraft, completion: @escaping (Result<String, Error>) -> Void) {
+        queue.async {
+            do {
+                try draft.validate()
+                guard Hashing.digest(packet.facts.url)?.hex == packet.digest else { throw ConfigError(message: "This file changed since you opened it. Reload before approving.") }
+                guard let facts = FileFacts(url: packet.facts.url) else { throw ConfigError(message: "The file is no longer available.") }
+                let inbox = self.inboxOrTemporary(for: facts.url.path)
+                inbox.known.insert(facts.url.path)
+                var action = Action()
+                action.trash = draft.trash
+                action.run = draft.command
+                if !draft.trash {
+                    // The engine preserves the source extension. Review does not change file formats.
+                    let name = URL(fileURLWithPath: draft.filename.trimmingCharacters(in: .whitespacesAndNewlines))
+                    guard name.pathExtension.lowercased() == facts.ext else { throw ConfigError(message: "Keep the .\(facts.extOriginal) extension; renaming cannot convert the document format.") }
+                    action.destination = Paths.expand(draft.folder)
+                    action.rename = facts.extOriginal.isEmpty ? name.lastPathComponent : name.deletingPathExtension().lastPathComponent
+                    action.tags = RuleDraft.list(draft.tags)
+                }
+                let previous = self.journal.entries.first?.id
+                let previousMetadata = try DocumentLibrary.shared.metadata(for: facts.url.path)
+                let rule = Rule(name: draft.ruleName, action: action)
+                let file = FileContext(facts: facts, metadata: draft.metadata) { packet.text }
+                self.perform(rule, file, in: inbox, enrichment: nil, origin: "manual", note: "reviewed")
+                let entry = self.journal.entries.first.flatMap { $0.id != previous ? $0 : nil }
+                if entry?.kind == .error || entry?.kind == .skipped { throw ConfigError(message: entry?.message ?? "The file could not be filed.") }
+                if !self.simulate, !draft.trash {
+                    let path = entry?.kind == .moved ? (entry?.to ?? facts.url.path) : facts.url.path
+                    if self.fm.fileExists(atPath: path) {
+                        try DocumentLibrary.shared.saveMetadata(draft.metadata, for: path)
+                        if let entry, entry.kind == .moved || entry.kind == .tagged {
+                            self.journal.recordMetadataEdit(entry.id, previous: previousMetadata)
+                        } else {
+                            let edit = JournalEntry(rule: draft.ruleName, kind: .tagged, from: path, message: "document details updated", origin: "manual", previousTags: Tags.read(URL(fileURLWithPath: path)), metadataEdited: true, previousMetadata: previousMetadata)
+                            self.journal.add(edit)
+                        }
+                        self.indexFiled(URL(fileURLWithPath: path))
+                    }
+                }
+                self.refreshPreviews()
+                self.publish()
+                let message = self.simulate ? "Preview recorded. No files changed." : "Approved."
+                DispatchQueue.main.async { completion(.success(message)) }
+            } catch { DispatchQueue.main.async { completion(.failure(error)) } }
+        }
+    }
+
+    private func indexFiled(_ url: URL, original: String = "") {
+        let config = self.config
+        // Capture the filed bytes now; a queued text extraction must not silently accept a later edit.
+        guard let filedDigest = Hashing.digest(url)?.hex else { return }
+        archiveQueue.async {
+            do {
+                var preserved = original
+                if preserved.isEmpty, config.keepOriginalsForever,
+                   (try DocumentLibrary.shared.document(at: url.path)?.original ?? "").isEmpty {
+                    preserved = try OriginalVault.keep(url).path
+                }
+                try DocumentLibrary.shared.index(url, config: config, original: preserved, filedDigest: filedDigest)
+                DispatchQueue.main.async { NotificationCenter.default.post(name: .ablageArchiveChanged, object: nil) }
+            } catch { Log.write("archive: " + error.localizedDescription) }
+        }
+    }
 
     func apply(ruleIndex: Int, to path: String) {
         queue.async {
@@ -429,6 +614,7 @@ final class Engine {
             var text = ""
             if let facts {
                 let raw = self.context(for: facts).content ?? ""
+                self.refreshPreview(for: facts)
                 text = String(raw.prefix(1500)).replacingOccurrences(of: "[ \\t]+", with: " ", options: .regularExpression)
             }
             DispatchQueue.main.async { completion(facts, text) }
@@ -459,11 +645,32 @@ final class Engine {
             let source: URL?
             switch entry.kind {
             case .moved: source = entry.to.map { URL(fileURLWithPath: $0) }
-            case .trashed, .duplicate: source = Paths.trash.appendingPathComponent(original.lastPathComponent)
+            case .trashed, .duplicate: source = entry.trashPath.map { URL(fileURLWithPath: $0) }
+            case .tagged: source = original
             default: source = nil
             }
             guard let source, self.fm.fileExists(atPath: source.path) else {
                 self.journal.add(JournalEntry(rule: "undo", kind: .error, from: entry.from, message: "file no longer there"))
+                self.publish()
+                return
+            }
+            if entry.kind == .tagged {
+                guard Tags.write(entry.previousTags, to: original) else {
+                    self.journal.add(JournalEntry(rule: "undo", kind: .error, from: entry.from, message: "Could not restore Finder tags"))
+                    self.publish()
+                    return
+                }
+                if entry.metadataEdited == true {
+                    do {
+                        if let metadata = entry.previousMetadata { try DocumentLibrary.shared.saveMetadata(metadata, for: original.path) }
+                        else { try DocumentLibrary.shared.clearMetadata(for: original.path) }
+                    } catch {
+                        self.journal.add(JournalEntry(rule: "undo", kind: .error, from: original.path, message: "Tags restored, but document details could not be restored: " + error.localizedDescription))
+                        self.publish(); return
+                    }
+                }
+                self.indexFiled(original)
+                self.journal.markUndone(id)
                 self.publish()
                 return
             }
@@ -474,10 +681,20 @@ final class Engine {
                 self.inbox(holding: target.path)?.known.insert(target.path)
                 try self.fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try self.fm.moveItem(at: source, to: target)
+                try? DocumentLibrary.shared.relocate(from: source.path, to: target.path)
                 if entry.kind == .moved {
                     Tags.write(entry.previousTags, to: target)
                     if Originals.restore(for: id, to: target) { Log.write("undo: original bytes restored for \(target.lastPathComponent)") }
                 }
+                if entry.metadataEdited == true {
+                    do {
+                        if let metadata = entry.previousMetadata { try DocumentLibrary.shared.saveMetadata(metadata, for: target.path) }
+                        else { try DocumentLibrary.shared.clearMetadata(for: target.path) }
+                    } catch {
+                        self.journal.add(JournalEntry(rule: "undo", kind: .error, from: target.path, message: "File restored, but document details could not be restored: " + error.localizedDescription))
+                    }
+                }
+                self.indexFiled(target)
                 self.journal.markUndone(id)
                 Log.write("undo [\(entry.rule)] \(Paths.abbreviate(source.path)) -> \(Paths.abbreviate(target.path))")
                 self.teachFromUndo(entry, restored: target)
@@ -502,13 +719,18 @@ final class Engine {
     private func context(for facts: FileFacts) -> FileContext {
         let config = self.config
         let cache = self.cache
-        return FileContext(facts: facts) { cache.text(for: facts, config: config, allowOCR: true) }
+        let metadata = (try? DocumentLibrary.shared.metadata(for: facts.url.path)) ?? DocumentMetadata()
+        return FileContext(facts: facts, metadata: metadata) { cache.text(for: facts, config: config, allowOCR: true) }
     }
 
     /// Plain rules first. Then what the user taught. Models only where a rule names one.
     @discardableResult
     private func process(url: URL, in inbox: Inbox, mode: Mode, forced: Rule? = nil) -> Bool {
+        guard !inbox.reviewFirst || mode == .all || forced != nil else { return false }
         guard let facts = FileFacts(url: url) else { return false }
+        // A run may resolve OCR without modifying the file. Retire its earlier plan,
+        // including any read-only preview still in flight, before publishing again.
+        previewRevisions[url.path, default: 0] += 1
         let file = context(for: facts)
         let rules = inbox.rules
 
@@ -522,13 +744,22 @@ final class Engine {
             if mode == .ageOnly, rule.match.minAgeDays == nil { return false }
             return Matcher.matches(rule.match, file)
         }
+        if let failure = cache.failure(cache.key(for: facts, config: config)) {
+            journal.add(JournalEntry(rule: "Text recognition", kind: .skipped, from: url.path, message: failure))
+            return true
+        }
         if let plain {
             perform(plain, file, in: inbox, enrichment: enrichment(for: plain, file, manual: false), origin: "rule", note: nil)
             return true
         }
         guard mode != .ageOnly else { return false }
 
-        if let suggestion = learnedSuggestion(file, rules: rules), let rule = rules.first(where: { $0.name == suggestion.rule }) {
+        let suggestion = learnedSuggestion(file, rules: rules)
+        if let failure = cache.failure(cache.key(for: facts, config: config)) {
+            journal.add(JournalEntry(rule: "Text recognition", kind: .skipped, from: url.path, message: failure))
+            return true
+        }
+        if let suggestion, let rule = rules.first(where: { $0.name == suggestion.rule }) {
             var note = "like \(suggestion.like) (\(Int(suggestion.similarity * 100))%)"
             if suggestion.confidence < 1 { note += ", \(Int(suggestion.confidence * 100))% sure" }
             perform(rule, file, in: inbox, enrichment: nil, origin: "learned", note: note)
@@ -575,7 +806,9 @@ final class Engine {
                 continue
             }
             let pool = only == nil ? candidates.filter { $0.match.ai?.model == name } : candidates
-            guard let result = classifier.classify(facts: facts, text: file.content, candidates: pool, model: name) else {
+            let text = file.content
+            guard manual || cache.failure(cache.key(for: facts, config: config)) == nil else { return false }
+            guard let result = classifier.classify(facts: facts, text: text, candidates: pool, model: name) else {
                 if manual { journal.add(JournalEntry(rule: name, kind: .skipped, from: facts.url.path, message: "no answer, see log")) }
                 continue
             }
@@ -598,26 +831,19 @@ final class Engine {
             Log.write("ai: \(name) is remote and not automatic, no enrichment for \(file.facts.name)")
             return nil
         }
-        return classifier.classify(facts: file.facts, text: file.content, candidates: [], model: name)
+        let text = file.content
+        guard manual || cache.failure(cache.key(for: file.facts, config: config)) == nil else { return nil }
+        return classifier.classify(facts: file.facts, text: text, candidates: [], model: name)
     }
 
     private func perform(_ rule: Rule, _ file: FileContext, in inbox: Inbox, enrichment: Classification?, origin: String, note: String?) {
         let facts = file.facts
         let action = rule.action
-        var date = facts.modified
-        if action.usesDate {
-            switch action.dateFrom ?? (enrichment != nil ? "content" : "file") {
-            case "content":
-                date = enrichment?.date ?? file.content.flatMap(Extract.date) ?? Extract.date(in: facts.stem) ?? facts.modified
-            case "filename":
-                date = Extract.date(in: facts.stem) ?? facts.modified
-            default:
-                date = enrichment?.date ?? facts.modified
-            }
+        let context = rule.templateContext(for: file, enrichment: enrichment)
+        if origin != "manual", let failure = cache.failure(cache.key(for: facts, config: config)) {
+            journal.add(JournalEntry(rule: rule.name, kind: .skipped, from: facts.url.path, message: failure))
+            return
         }
-        let context = TemplateContext(
-            date: date, name: facts.stem, ext: facts.ext, correspondent: action.correspondent ?? enrichment?.correspondent ?? "",
-            title: enrichment?.title ?? "", rule: rule.name, host: facts.host)
         var notes: [String] = []
         if let note { notes.append(note) }
         if let e = enrichment {
@@ -633,8 +859,10 @@ final class Engine {
                 return
             }
             do {
-                try fm.trashItem(at: facts.url, resultingItemURL: nil)
-                journal.add(JournalEntry(rule: rule.name, kind: .trashed, from: facts.url.path, message: message, origin: origin))
+                var trashed: NSURL?
+                try fm.trashItem(at: facts.url, resultingItemURL: &trashed)
+                if let target = trashed?.path { try? DocumentLibrary.shared.retire(facts.url.path, trash: target) }
+                journal.add(JournalEntry(rule: rule.name, kind: .trashed, from: facts.url.path, trashPath: trashed?.path, message: message, origin: origin))
                 notify(rule.name, "\(facts.name) → Trash", path: nil)
                 if let command = action.run { runHook(command, rule: rule.name, from: facts.url.path, to: nil) }
             } catch {
@@ -652,21 +880,27 @@ final class Engine {
             return
         }
 
-        let folder = action.destination.map { Template.destination($0, context, inbox: inbox.url) } ?? facts.url.deletingLastPathComponent()
-        let stem = action.rename.map { Template.filename(Template.expand($0, context)) } ?? facts.stem
-        let filename = facts.extOriginal.isEmpty ? stem : "\(stem).\(facts.extOriginal)"
-        var target = folder.appendingPathComponent(filename)
+        var target = rule.targetURL(for: facts, context: context, inbox: inbox.url)
+        if Patterns.matches(#"\{(?:invoice_number|amount|currency|due_date|type|field\.[^{}]+)\}"#, target.path) {
+            journal.add(JournalEntry(rule: rule.name, kind: .skipped, from: facts.url.path, message: "Document fields need completing in Review & file."))
+            return
+        }
+        let folder = target.deletingLastPathComponent()
         let previousTags = Tags.read(facts.url)
         let newTags = (action.tags ?? []).filter { !previousTags.contains($0) }
 
-        if target.path == facts.url.path {
+        if FileIdentity.same(target, facts.url) {
             guard !newTags.isEmpty else { return }
             if simulate {
                 journal.add(JournalEntry(rule: rule.name, kind: .simulated, from: facts.url.path, message: "would tag \(newTags.joined(separator: ", "))", origin: origin))
                 return
             }
-            Tags.write(previousTags + newTags, to: facts.url)
+            guard Tags.write(previousTags + newTags, to: facts.url) else {
+                journal.add(JournalEntry(rule: rule.name, kind: .error, from: facts.url.path, message: "Could not update Finder tags"))
+                return
+            }
             journal.add(JournalEntry(rule: rule.name, kind: .tagged, from: facts.url.path, message: newTags.joined(separator: ", "), origin: origin, previousTags: previousTags))
+            indexFiled(facts.url)
             if let command = action.run { runHook(command, rule: rule.name, from: facts.url.path, to: facts.url.path) }
             return
         }
@@ -677,12 +911,16 @@ final class Engine {
         // Features are read before the move, while the file is still where the facts say.
         let learnText = config.learning.enabled ? file.content : nil
         do {
+            var original = try DocumentLibrary.shared.document(at: facts.url.path)?.original ?? ""
+            if original.isEmpty, config.keepOriginalsForever, !facts.isFolder { original = try OriginalVault.keep(facts.url).path }
             try fm.createDirectory(at: folder, withIntermediateDirectories: true)
             if fm.fileExists(atPath: target.path) {
                 if !facts.isFolder, Hashing.identical(facts.url, target) {
-                    try fm.trashItem(at: facts.url, resultingItemURL: nil)
+                    var trashed: NSURL?
+                    try fm.trashItem(at: facts.url, resultingItemURL: &trashed)
+                    if let target = trashed?.path { try? DocumentLibrary.shared.retire(facts.url.path, trash: target) }
                     journal.add(JournalEntry(
-                        rule: rule.name, kind: .duplicate, from: facts.url.path, to: target.path,
+                        rule: rule.name, kind: .duplicate, from: facts.url.path, to: target.path, trashPath: trashed?.path,
                         message: "identical file already there, copy moved to Trash", origin: origin))
                     notify(rule.name, "\(facts.name) is a duplicate, moved to Trash", path: target.path)
                     return
@@ -690,9 +928,11 @@ final class Engine {
                 target = Hashing.unique(target)
             }
             try fm.moveItem(at: facts.url, to: target)
+            try? DocumentLibrary.shared.relocate(from: facts.url.path, to: target.path)
             if !newTags.isEmpty { Tags.write(previousTags + newTags, to: target) }
             let entry = JournalEntry(rule: rule.name, kind: .moved, from: facts.url.path, to: target.path, message: message, origin: origin, previousTags: previousTags)
             journal.add(entry)
+            indexFiled(target, original: original)
             remember(rule, facts, text: learnText, origin: origin, entryId: entry.id)
             notify(rule.name, "\(facts.name) → \(Paths.abbreviate(folder.path))", path: target.path)
             if let command = action.run { runHook(command, rule: rule.name, from: facts.url.path, to: target.path) }
@@ -722,14 +962,34 @@ final class Engine {
             guard let self else { return }
             guard let size = (try? self.fm.attributesOfItem(atPath: url.path))?[.size] as? NSNumber, size.int64Value <= maxBytes else { return }
             guard !SearchablePDF.hasTextLayer(url) else { return }
+            let work = self.fm.temporaryDirectory.appendingPathComponent("ablage-ocr-" + UUID().uuidString, isDirectory: true)
+            let staged = work.appendingPathComponent(url.lastPathComponent)
             do {
-                try Originals.keep(url, for: entryId)
-                let pages = try SearchablePDF.addTextLayer(to: url, maxPages: maxPages)
+                // OCR works on a private copy. Undo and later filings can proceed independently.
+                try self.fm.createDirectory(at: work, withIntermediateDirectories: true)
+                try self.fm.copyItem(at: url, to: staged)
+                guard let originalHash = Hashing.digest(staged) else { throw ConfigError(message: "Could not read PDF for OCR") }
+                let pages = try SearchablePDF.addTextLayer(to: staged, maxPages: maxPages)
                 self.queue.async {
-                    self.journal.add(JournalEntry(rule: rule, kind: .textLayer, from: url.path, to: url.path, message: "searchable now, \(pages) page\(pages == 1 ? "" : "s") of text", origin: "rule"))
-                    self.publish()
+                    defer { try? self.fm.removeItem(at: work) }
+                    // Never recreate an undone file or overwrite a document edited during OCR.
+                    guard self.journal.entries.contains(where: { $0.id == entryId && !$0.undone }),
+                          Hashing.digest(url) == originalHash else {
+                        Log.write("text layer: skipped changed or undone file \(url.lastPathComponent)")
+                        return
+                    }
+                    do {
+                        let tags = Tags.read(url)
+                        try Originals.keep(url, for: entryId)
+                        _ = try self.fm.replaceItemAt(url, withItemAt: staged)
+                        Tags.write(tags, to: url)
+                        self.indexFiled(url)
+                        self.journal.add(JournalEntry(rule: rule, kind: .textLayer, from: url.path, to: url.path, message: "searchable now, \(pages) page\(pages == 1 ? "" : "s") of text", origin: "rule"))
+                        self.publish()
+                    } catch { Log.write("text layer: \(url.lastPathComponent): \(error.localizedDescription)") }
                 }
             } catch {
+                try? self.fm.removeItem(at: work)
                 Log.write("text layer: \(url.lastPathComponent): \(error.localizedDescription)")
             }
         }
@@ -774,36 +1034,123 @@ final class Engine {
 
     // MARK: Previews
 
+    func refreshPreviews() {
+        queue.async {
+            self.previewGeneration += 1
+            self.previews.removeAll()
+            self.previewInFlight.removeAll()
+            self.schedulePreviews()
+            self.publish()
+        }
+    }
+
+    private func previewKey(for facts: FileFacts) -> String {
+        cache.key(for: facts, config: config) + "|\(facts.ageDays)|\(previewRevisions[facts.url.path, default: 0])|" + Tags.read(facts.url).sorted().joined(separator: "\u{1f}")
+    }
+
     private func schedulePreviews() {
-        let config = self.config
-        let learner = self.learner
+        var liveKeys = Set<String>()
+        var livePaths = Set<String>()
         for inbox in inboxes {
-            let rules = inbox.rules.filter(\.isEnabled)
-            let learnable = learnableRules(rules)
             for url in list(inbox) where inbox.known.contains(url.path) && inbox.pending[url.path] == nil {
                 guard let facts = FileFacts(url: url) else { continue }
-                let key = cache.key(for: facts)
-                if previews[key] != nil || previewInFlight.contains(key) { continue }
-                previewInFlight.insert(key)
-                previewQueue.async { [weak self] in
-                    guard let self else { return }
-                    let file = FileContext(facts: facts) { self.cache.text(for: facts, config: config, allowOCR: false) }
-                    var name = rules.first { $0.match.ai == nil && Matcher.matches($0.match, file) }?.name ?? ""
-                    if name.isEmpty, config.learning.enabled, !learnable.isEmpty,
-                       let s = learner.suggest(facts: facts, text: file.content, among: learnable, config: config.learning) {
-                        name = "learned:\(s.rule)"
+                liveKeys.insert(previewKey(for: facts))
+                livePaths.insert(url.path)
+                schedulePreview(for: facts, in: inbox)
+            }
+        }
+        previews = previews.filter { liveKeys.contains($0.key) }
+        previewRevisions = previewRevisions.filter { livePaths.contains($0.key) }
+        recognitionPending = recognitionPending.filter { livePaths.contains($0.value.url.path) }
+        recognitionOrder.removeAll { recognitionPending[$0] == nil }
+    }
+
+    private func schedulePreview(for facts: FileFacts, in inbox: Inbox) {
+        let key = previewKey(for: facts)
+        guard previews[key] == nil, !previewInFlight.contains(key) else { return }
+        let config = self.config
+        let generation = previewGeneration
+        let rules = inbox.rules.filter(\.isEnabled)
+        let learnable = learnableRules(rules)
+        let contentKey = cache.key(for: facts, config: config)
+        previewInFlight.insert(key)
+        previewQueue.async { [weak self] in
+            guard let self else { return }
+            let metadata = (try? DocumentLibrary.shared.metadata(for: facts.url.path)) ?? DocumentMetadata()
+            let file = FileContext(facts: facts, metadata: metadata) { self.cache.text(for: facts, config: config, allowOCR: false) }
+            let plan = FilePlan.evaluate(rules: rules, file: file, inbox: inbox.url, config: config,
+                ocrPending: { self.cache.ocrPending(contentKey) },
+                textFailure: { self.cache.failure(contentKey) },
+                learned: {
+                    guard config.learning.enabled, !learnable.isEmpty else { return nil }
+                    return self.learner.suggest(facts: facts, text: file.content, among: learnable, config: config.learning)
+                })
+            self.queue.async {
+                guard self.previewGeneration == generation else { return }
+                self.previewInFlight.remove(key)
+                guard let current = FileFacts(url: facts.url), self.previewKey(for: current) == key else { return }
+                self.previews[key] = plan.state == .needsOCR && self.recognitionActive == contentKey ? .readingText : plan
+                if self.cache.ocrPending(contentKey) { self.enqueueRecognition(facts) }
+                self.schedulePublish()
+            }
+        }
+    }
+
+    private func refreshPreview(for facts: FileFacts) {
+        guard let inbox = inboxes.first(where: { $0.holds(facts.url.path) }), inbox.pending[facts.url.path] == nil else { return }
+        previews.removeValue(forKey: previewKey(for: facts))
+        previewRevisions[facts.url.path, default: 0] += 1
+        schedulePreview(for: facts, in: inbox)
+        schedulePublish()
+    }
+
+    /// Only extraction happens here: no file mutations, rule actions or model requests.
+    private func enqueueRecognition(_ facts: FileFacts, first: Bool = false) {
+        let key = cache.key(for: facts, config: config)
+        guard recognitionActive != key else { return }
+        if first { recognitionOrder.removeAll { $0 == key } }
+        if recognitionPending[key] == nil || first {
+            recognitionPending[key] = facts
+            if first { recognitionOrder.insert(key, at: 0) } else { recognitionOrder.append(key) }
+        }
+        startRecognition()
+    }
+
+    private func startRecognition() {
+        guard !paused, recognitionActive == nil else { return }
+        while !recognitionOrder.isEmpty {
+            let key = recognitionOrder.removeFirst()
+            guard let facts = recognitionPending.removeValue(forKey: key),
+                  let current = FileFacts(url: facts.url), cache.key(for: current, config: config) == key,
+                  inboxes.contains(where: { $0.holds(facts.url.path) && $0.known.contains(facts.url.path) && $0.pending[facts.url.path] == nil }),
+                  cache.ocrPending(key) else { continue }
+            let config = self.config
+            recognitionActive = key
+            let planKey = previewKey(for: facts)
+            if previews[planKey]?.state == .needsOCR { previews[planKey] = .readingText }
+            schedulePublish()
+            recognitionQueue.async { [weak self] in
+                guard let self else { return }
+                _ = self.cache.text(for: facts, config: config, allowOCR: true)
+                self.queue.async {
+                    self.recognitionActive = nil
+                    if let current = FileFacts(url: facts.url), self.cache.key(for: current, config: self.config) == key {
+                        self.refreshPreview(for: current)
                     }
-                    if name.isEmpty, let model = rules.first(where: { $0.match.ai != nil && Matcher.matches($0.match, file) })?.match.ai?.model {
-                        name = (config.ai.models[model]?.runsAutomatically ?? false) ? "AI:\(model)" : "AI?:\(model)"
-                    }
-                    if name.isEmpty, self.cache.ocrPending(key) { name = "?" }
-                    self.queue.async {
-                        self.previewInFlight.remove(key)
-                        self.previews[key] = name
-                        self.schedulePublish()
-                    }
+                    self.startRecognition()
                 }
             }
+            return
+        }
+    }
+
+    func readTextNext(path: String) {
+        queue.async {
+            guard let facts = FileFacts(url: URL(fileURLWithPath: path)) else { return }
+            let key = self.cache.key(for: facts, config: self.config)
+            self.cache.retryFailure(key)
+            if self.cache.ocrPending(key) { self.enqueueRecognition(facts, first: true) }
+            self.refreshPreview(for: facts)
         }
     }
 
@@ -833,18 +1180,19 @@ final class Engine {
             var own: [InboxItem] = []
             for url in list(inbox) {
                 guard let facts = FileFacts(url: url) else { continue }
-                let preview = previews[cache.key(for: facts)].flatMap { $0.isEmpty ? nil : $0 }
+                let preview = previews[previewKey(for: facts)]
                 own.append(InboxItem(
                     id: url.path, inboxIndex: index, name: facts.name, isFolder: facts.isFolder, size: facts.size, ageDays: facts.ageDays,
-                    added: facts.added, status: inbox.pending[url.path] != nil ? .settling : .unsorted, preview: preview))
+                    added: facts.added, status: (inbox.pending[url.path] != nil || !inbox.known.contains(url.path)) ? .settling : .unsorted, preview: preview))
             }
             own.sort { $0.added > $1.added }
             items += own
         }
+        let issues = ([configError] + inboxes.map(\.accessError)).compactMap { $0 }
         let snapshot = Snapshot(
-            inboxes: inboxes.map { InboxInfo(label: $0.label, path: $0.url.path, ruleNames: $0.rules.map(\.name)) },
-            items: items, journal: Array(journal.entries.prefix(50)), aiModels: config.ai.modelNames,
-            configError: configError, progress: progress, filedThisMonth: filedThisMonth(), examples: learner.examples.count)
+            inboxes: inboxes.map { InboxInfo(label: $0.label, path: $0.url.path, ruleNames: $0.rules.map(\.name), enabled: $0.enabled, reviewFirst: $0.reviewFirst) },
+            items: items, journal: journal.entries, aiModels: config.ai.modelNames,
+            configError: issues.isEmpty ? nil : issues.joined(separator: "\n"), progress: progress, filedThisMonth: filedThisMonth(), examples: learner.examples.count)
         onUpdate?(snapshot)
     }
 }

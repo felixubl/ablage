@@ -18,30 +18,41 @@ final class FolderWatcher {
 }
 
 final class ContentCache {
-    private struct Entry {
-        var text: String
-        var ocrPending: Bool
-    }
+    private var entries = [String: Extract.Result]()
+    private var recognizing = Set<String>()
+    private let lock = NSCondition()
+    private let extract: (FileFacts, Config, Bool) -> Extract.Result?
 
-    private var entries = [String: Entry]()
-    private let lock = NSLock()
+    init(extract: @escaping (FileFacts, Config, Bool) -> Extract.Result? = { facts, config, allowOCR in
+        Extract.text(of: facts.url, ext: facts.ext, size: facts.size, config: config, allowOCR: allowOCR)
+    }) { self.extract = extract }
 
     func key(for f: FileFacts) -> String {
         "\(f.url.path)|\(f.modified.timeIntervalSince1970)|\(f.size)"
     }
 
+    func key(for f: FileFacts, config: Config) -> String {
+        key(for: f) + "|\(config.ocr)|\(config.ocrPages)|\(config.ocrMaxMB)"
+    }
+
     func text(for f: FileFacts, config: Config, allowOCR: Bool) -> String? {
         guard !f.isFolder, Extract.supports(f.ext) else { return nil }
-        let key = key(for: f)
+        let key = key(for: f, config: config)
         lock.lock()
-        let cached = entries[key]
+        while allowOCR && recognizing.contains(key) { lock.wait() }
+        if let cached = entries[key], !(cached.ocrPending && allowOCR) {
+            lock.unlock(); return cached.text
+        }
+        if allowOCR { recognizing.insert(key) }
         lock.unlock()
-        if let cached, !(cached.ocrPending && allowOCR) { return cached.text }
-        guard let result = Extract.text(of: f.url, ext: f.ext, size: f.size, config: config, allowOCR: allowOCR) else { return nil }
+        let result = extract(f, config, allowOCR)
         lock.lock()
+        defer { if allowOCR { recognizing.remove(key) }; lock.broadcast(); lock.unlock() }
         if entries.count > 3000 { entries.removeAll() }
-        entries[key] = Entry(text: result.text, ocrPending: result.ocrPending)
-        lock.unlock()
+        guard let result else { return nil }
+        // A fast preview finishing late must never overwrite completed recognition.
+        if result.ocrPending, let completed = entries[key], !completed.ocrPending { return completed.text }
+        entries[key] = result
         return result.text
     }
 
@@ -50,35 +61,54 @@ final class ContentCache {
         defer { lock.unlock() }
         return entries[key]?.ocrPending ?? false
     }
+
+    func failure(_ key: String) -> String? {
+        lock.lock(); defer { lock.unlock() }; return entries[key]?.failure
+    }
+
+    func retryFailure(_ key: String) {
+        lock.lock(); defer { lock.unlock() }
+        if entries[key]?.failure != nil { entries.removeValue(forKey: key) }
+    }
 }
 
 enum Tags {
     static func read(_ url: URL) -> [String] {
-        (try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames) ?? []
+        // URL caches resource values. Always ask a fresh URL after an edit or Undo.
+        let fresh = URL(fileURLWithPath: url.path)
+        return (try? fresh.resourceValues(forKeys: [.tagNamesKey]).tagNames) ?? []
     }
 
-    static func write(_ tags: [String], to url: URL) {
-        try? (url as NSURL).setResourceValue(tags, forKey: .tagNamesKey)
+    @discardableResult
+    static func write(_ tags: [String], to url: URL) -> Bool {
+        do {
+            try (url as NSURL).setResourceValue(tags, forKey: .tagNamesKey)
+            return true
+        } catch {
+            Log.write("tags: \(url.lastPathComponent): \(error.localizedDescription)")
+            return false
+        }
     }
 }
 
 enum Hashing {
     static func identical(_ a: URL, _ b: URL) -> Bool {
         guard let sa = size(a), let sb = size(b), sa == sb else { return false }
-        return digest(a) == digest(b)
+        guard let first = digest(a), let second = digest(b) else { return false }
+        return first == second
     }
 
     private static func size(_ url: URL) -> Int? {
         try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize
     }
 
-    private static func digest(_ url: URL) -> Data? {
+    static func digest(_ url: URL) -> Data? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
         var sha = SHA256()
-        while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty {
-            sha.update(data: chunk)
-        }
+        do {
+            while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty { sha.update(data: chunk) }
+        } catch { return nil }
         return Data(sha.finalize())
     }
 

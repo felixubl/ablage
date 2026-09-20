@@ -7,6 +7,9 @@ struct Rule: Decodable {
     var action: Action
 
     var isEnabled: Bool { enabled ?? true }
+    init(name: String, match: Match = Match(), action: Action = Action()) {
+        self.name = name; self.match = match; self.action = action
+    }
 
     private enum CodingKeys: String, CodingKey { case name, enabled, match, action }
 
@@ -70,13 +73,15 @@ struct Action: Decodable {
 /// One file on its way through the rules: facts plus lazily loaded text and words.
 final class FileContext {
     let facts: FileFacts
+    let metadata: DocumentMetadata
     private let provider: () -> String?
     private var loaded = false
     private var text: String?
     private var wordCache: Set<String>?
 
-    init(facts: FileFacts, provider: @escaping () -> String?) {
+    init(facts: FileFacts, metadata: DocumentMetadata = DocumentMetadata(), provider: @escaping () -> String?) {
         self.facts = facts
+        self.metadata = metadata
         self.provider = provider
     }
 

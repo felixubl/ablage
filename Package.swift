@@ -5,6 +5,7 @@ let package = Package(
     name: "Ablage",
     platforms: [.macOS(.v14)],
     targets: [
-        .executableTarget(name: "Ablage", path: "Sources/Ablage")
+        .executableTarget(name: "Ablage", path: "Sources/Ablage"),
+        .testTarget(name: "AblageTests", dependencies: ["Ablage"])
     ]
 )

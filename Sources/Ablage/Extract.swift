@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ImageIO
 import PDFKit
 import Vision
 
@@ -19,6 +20,7 @@ enum Extract {
         var text: String
         /// True when the file has no text layer and OCR was needed but not allowed in this pass.
         var ocrPending: Bool
+        var failure: String? = nil
     }
 
     static func supports(_ ext: String) -> Bool {
@@ -36,9 +38,17 @@ enum Extract {
         }
         if imageExtensions.contains(ext) {
             guard ocrAllowed else { return Result(text: "", ocrPending: false) }
+            // Valid tracking pixels and tiny icons contain no readable document text.
+            // Vision rejects these dimensions; treat them as empty instead of unreadable.
+            if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+               let width = properties[kCGImagePropertyPixelWidth] as? Int,
+               let height = properties[kCGImagePropertyPixelHeight] as? Int,
+               width <= 2 || height <= 2 { return Result(text: "", ocrPending: false) }
             guard allowOCR else { return Result(text: "", ocrPending: true) }
             let handler = VNImageRequestHandler(url: url, options: [:])
-            return Result(text: clip(ocr(handler)), ocrPending: false)
+            do { return Result(text: clip(try ocr(handler)), ocrPending: false) }
+            catch { return Result(text: "", ocrPending: false, failure: error.localizedDescription) }
         }
         if let members = officeMembers[ext] {
             return Result(text: clip(unzipText(url, members: members)), ocrPending: false)
@@ -47,7 +57,8 @@ enum Extract {
     }
 
     private static func pdf(_ url: URL, pages: Int, ocrAllowed: Bool, allowOCR: Bool) -> Result? {
-        guard let doc = PDFDocument(url: url) else { return nil }
+        guard let doc = PDFDocument(url: url) else { return Result(text: "", ocrPending: false, failure: "This PDF could not be opened.") }
+        guard !doc.isLocked else { return Result(text: "", ocrPending: false, failure: "This PDF is password protected.") }
         var text = ""
         for i in 0..<min(doc.pageCount, 40) {
             if let s = doc.page(at: i)?.string { text += s + "\n" }
@@ -59,10 +70,12 @@ enum Extract {
         guard ocrAllowed else { return Result(text: text, ocrPending: false) }
         guard allowOCR else { return Result(text: text, ocrPending: true) }
         var recognized = ""
-        for i in 0..<min(doc.pageCount, max(1, pages)) {
-            guard let page = doc.page(at: i), let image = render(page) else { continue }
-            recognized += ocr(VNImageRequestHandler(cgImage: image, options: [:])) + "\n"
-        }
+        do {
+            for i in 0..<min(doc.pageCount, max(1, pages)) {
+                guard let page = doc.page(at: i), let image = render(page) else { throw ConfigError(message: "Could not read page \(i + 1) for text recognition.") }
+                recognized += try ocr(VNImageRequestHandler(cgImage: image, options: [:])) + "\n"
+            }
+        } catch { return Result(text: text, ocrPending: false, failure: error.localizedDescription) }
         return Result(text: clip(recognized), ocrPending: false)
     }
 
@@ -78,17 +91,12 @@ enum Extract {
         return image.cgImage(forProposedRect: nil, context: nil, hints: nil)
     }
 
-    private static func ocr(_ handler: VNImageRequestHandler) -> String {
+    private static func ocr(_ handler: VNImageRequestHandler) throws -> String {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["de-DE", "en-US"]
         request.usesLanguageCorrection = true
-        do {
-            try handler.perform([request])
-        } catch {
-            Log.write("ocr failed: \(error.localizedDescription)")
-            return ""
-        }
+        try handler.perform([request])
         return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
     }
 

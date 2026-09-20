@@ -4,190 +4,222 @@ import SwiftUI
 struct PanelView: View {
     @EnvironmentObject private var state: AppState
     @State private var filter = ""
-    private let maxRows = 150
+    @State private var inboxPath = ""
+    @State private var showActivity = false
+    @State private var dropTarget = false
+
+    init(showingActivity: Bool = false) { _showActivity = State(initialValue: showingActivity) }
 
     private var visibleItems: [InboxItem] {
-        let needle = filter.trimmingCharacters(in: .whitespaces)
-        guard !needle.isEmpty else { return state.items }
-        return state.items.filter { $0.name.localizedCaseInsensitiveContains(needle) }
+        state.items.filter { item in
+            (inboxPath.isEmpty || state.inboxes[safe: item.inboxIndex]?.path == inboxPath) &&
+            (filter.isEmpty || item.name.localizedCaseInsensitiveContains(filter) || item.plan.searchText.localizedCaseInsensitiveContains(filter))
+        }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            header.padding(12)
+            header.padding(18)
             Divider()
-            inbox
-            Divider()
-            activity
-            Divider()
-            footer.padding(.horizontal, 12).padding(.vertical, 8)
-        }
-        .frame(width: 400)
-        .quickLookPreview($state.quickLook)
-    }
-
-    // MARK: Header
-
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Ablage").font(.headline)
-                    ForEach(state.inboxes, id: \.path) { info in
-                        Button(info.label) { state.openInbox(info) }
-                            .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                Spacer()
-                Toggle("Simulate", isOn: $state.simulate)
-                Toggle("Pause", isOn: $state.paused)
-            }
-            .toggleStyle(.switch).controlSize(.mini)
             if let error = state.configError {
-                Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                HStack(alignment: .top) {
+                    Image(systemName: "exclamationmark.triangle")
+                    Text(error).textSelection(.enabled)
+                    Spacer()
+                    Button("Settings") { state.openSettings() }
+                }.font(.caption).foregroundStyle(Palette.red).padding(12).background(Palette.red.opacity(0.06))
             }
             if state.simulate {
-                Text("Simulation: rules only report what they would do. Turn it off once the activity list looks right.")
-                    .font(.caption).foregroundStyle(.secondary)
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "eye")
+                    Text("Preview mode. See what your rules would do before moving a single file.")
+                }.font(.caption).foregroundStyle(Palette.blue).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 18).padding(.vertical, 10).background(Palette.blue.opacity(0.05))
             }
-            if let p = state.progress {
-                ProgressView(value: Double(p.done), total: Double(max(p.total, 1))) {
-                    Text("Sorting \(p.done) of \(p.total)").font(.caption)
+            if let progress = state.progress {
+                HStack {
+                    ProgressView(value: Double(progress.done), total: Double(max(1, progress.total))) {
+                        Text("Filing \(progress.done) of \(progress.total)").font(.caption)
+                    }
+                    Button("Stop") { state.engine.cancelCurrentBatch() }.controlSize(.small).help("Stop after the current file")
+                }.padding(12)
+            }
+            HStack {
+                Picker("Show", selection: $showActivity) {
+                    Text("Inbox · \(state.unsortedCount)").tag(false)
+                    Text("Activity").tag(true)
+                }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: .infinity)
+                Button { showActivity ? state.openHistory() : state.openReview() } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
+                    .buttonStyle(.plain).help(showActivity ? "Full activity history" : "Open review window")
+            }.padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 10)
+            if showActivity { activity } else { inbox }
+            Divider()
+            footer.padding(14)
+        }
+        .frame(width: 440)
+        .background(Palette.paper).tint(Palette.blue)
+        .quickLookPreview($state.quickLook)
+        .onChange(of: state.inboxes) { _, folders in if !folders.contains(where: { $0.path == inboxPath }) { inboxPath = "" } }
+    }
+
+    private var header: some View {
+        VStack(spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 10) { BrandMark(); Text("Ablage").font(.system(size: 26, weight: .semibold, design: .serif)) }
+                    Text(state.paused ? "Taking a breather. Arrivals will wait." : "A little order, automatically.").font(.callout).foregroundStyle(.secondary)
                 }
+                Spacer()
+                Menu {
+                    Button("Inboxes & rules…") { state.openSettings() }.keyboardShortcut(",")
+                    Button("Review files…") { state.openReview() }.keyboardShortcut("r")
+                    Button("Activity history…") { state.openHistory() }
+                    Button("Search archive…") { state.openArchive() }.keyboardShortcut("f", modifiers: [.command, .shift])
+                    Button("Find duplicates…") { state.openDuplicates() }
+                    Divider()
+                    ForEach(state.inboxes, id: \.path) { info in Button("Open " + info.label) { state.openInbox(info) } }
+                    Divider()
+                    Toggle("Launch at login", isOn: $state.launchAtLogin)
+                    Button("Open log") { state.openLog() }
+                    Button("Quit Ablage") { NSApp.terminate(nil) }.keyboardShortcut("q")
+                } label: { Image(systemName: "gearshape").font(.system(size: 16)) }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Settings and more")
             }
-            Text(stats).font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 14) {
+                Label(state.paused ? "Paused" : "Watching \(state.inboxes.filter(\.enabled).count) inbox\(state.inboxes.filter(\.enabled).count == 1 ? "" : "es")", systemImage: state.paused ? "pause.circle" : "circle.fill")
+                    .font(.caption).foregroundStyle(state.paused ? .secondary : Palette.green)
+                Spacer()
+                Toggle("Preview", isOn: $state.simulate).help("Simulation: record planned actions without changing files")
+                Toggle("Pause", isOn: $state.paused).help("Hold new arrivals until resumed")
+            }.toggleStyle(.switch).controlSize(.mini)
         }
     }
-
-    private var stats: String {
-        var parts = ["\(state.filedThisMonth) filed this month"]
-        if state.examples > 0 { parts.append("\(state.examples) learned examples") }
-        return parts.joined(separator: " · ")
-    }
-
-    // MARK: Inbox
 
     private var inbox: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(spacing: 0) {
             HStack {
-                Text(inboxTitle).font(.subheadline).foregroundStyle(.secondary)
-                Spacer()
-                Button("Review…") { state.openReview() }.controlSize(.small).disabled(state.unsortedCount == 0)
-                Button("Sort now…") { state.confirmSortAll() }
-                    .controlSize(.small).disabled(state.unsortedCount == 0 || state.progress != nil)
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Find a file, action or rule", text: $filter).textFieldStyle(.plain)
+                if !filter.isEmpty { Button { filter = "" } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain).help("Clear search") }
+                Button { state.engine.refreshPreviews() } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.plain).help("Refresh file plans · ⌘R").keyboardShortcut("r")
+            }.padding(9).background(Palette.surface, in: RoundedRectangle(cornerRadius: 8)).padding(.horizontal, 18)
+            if state.inboxes.count > 1 {
+                Picker("Inbox", selection: $inboxPath) {
+                    Text("All inboxes").tag("")
+                    ForEach(state.inboxes, id: \.path) { Text($0.label).tag($0.path) }
+                }.controlSize(.small).padding(.horizontal, 18).padding(.top, 10)
             }
-            .padding(.horizontal, 12).padding(.vertical, 8)
-            if state.items.count > 12 {
-                TextField("Filter", text: $filter, prompt: Text("Filter by name"))
-                    .textFieldStyle(.roundedBorder).controlSize(.small)
-                    .padding(.horizontal, 12).padding(.bottom, 6)
-            }
-            if state.items.isEmpty {
-                Text("Inbox is empty. Drop files here to file them by the rules.").font(.callout).foregroundStyle(.secondary)
-                    .padding(.horizontal, 12).padding(.bottom, 10)
-            } else if visibleItems.isEmpty {
-                Text("Nothing matches the filter.").font(.callout).foregroundStyle(.secondary)
-                    .padding(.horizontal, 12).padding(.bottom, 10)
+            if visibleItems.isEmpty {
+                EmptyState(symbol: filter.isEmpty ? "tray" : "magnifyingglass", title: filter.isEmpty ? "All clear." : "No matching files", detail: filter.isEmpty ? "New arrivals appear here. You can also drop files in to run your rules." : "Try a different filename, action or rule.")
             } else {
-                let items = visibleItems
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(items.prefix(maxRows).enumerated()), id: \.element.id) { index, item in
-                            if state.inboxes.count > 1, index == 0 || items[index - 1].inboxIndex != item.inboxIndex {
-                                Text(state.inboxes[item.inboxIndex].label).font(.caption).foregroundStyle(.secondary)
-                                    .padding(.horizontal, 12).padding(.top, 6).padding(.bottom, 2)
-                            }
-                            InboxRow(item: item).environmentObject(state)
-                        }
-                        if items.count > maxRows {
-                            Text("and \(items.count - maxRows) more").font(.caption).foregroundStyle(.secondary)
-                                .padding(.horizontal, 12).padding(.vertical, 6)
-                        }
-                    }
+                    LazyVStack(spacing: 2) {
+                        ForEach(visibleItems.prefix(60)) { item in InboxRow(item: item).environmentObject(state) }
+                    }.padding(.vertical, 8)
+                }.frame(height: min(310, CGFloat(visibleItems.count) * 84 + 16))
+                if visibleItems.count > 60 {
+                    Button("Review all \(visibleItems.count) files…") { state.openReview() }.buttonStyle(.plain).font(.caption).foregroundStyle(Palette.blue).padding(.bottom, 10)
                 }
-                .frame(maxHeight: 320)
             }
+            HStack {
+                Text("\(state.filedThisMonth) recent filings this month").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Review…") { state.openReview() }.controlSize(.small)
+                Button(state.simulate ? "Preview rules…" : "Sort now…") { state.confirmSortAll() }
+                    .controlSize(.small).disabled(state.unsortedCount == 0 || state.progress != nil)
+            }.padding(.horizontal, 18).padding(.bottom, 14)
         }
+        .background(dropTarget ? Palette.green.opacity(0.08) : .clear)
         .dropDestination(for: URL.self) { urls, _ in
             let files = urls.filter(\.isFileURL)
             guard !files.isEmpty else { return false }
             state.file(files)
             return true
-        }
+        } isTargeted: { dropTarget = $0 }
     }
-
-    private var inboxTitle: String {
-        var parts = ["Inbox"]
-        if state.unsortedCount > 0 { parts.append("\(state.unsortedCount) unsorted") }
-        if state.settlingCount > 0 { parts.append("\(state.settlingCount) arriving") }
-        return parts.joined(separator: " · ")
-    }
-
-    // MARK: Activity
 
     private var activity: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("Activity").font(.subheadline).foregroundStyle(.secondary)
-                .padding(.horizontal, 12).padding(.vertical, 8)
+        VStack(spacing: 0) {
             if state.journal.isEmpty {
-                Text("Nothing sorted yet.").font(.callout).foregroundStyle(.secondary)
-                    .padding(.horizontal, 12).padding(.bottom, 10)
+                EmptyState(symbol: "clock", title: "Your filing story starts here", detail: "Every action has a record. Moves, tags and Trash can be undone.")
             } else {
-                ForEach(state.journal.prefix(8)) { entry in
-                    ActivityRow(entry: entry).environmentObject(state)
-                }
-                .padding(.bottom, 4)
+                ScrollView {
+                    LazyVStack(spacing: 5) {
+                        ForEach(state.journal.prefix(12)) { ActivityRow(entry: $0).environmentObject(state) }
+                    }.padding(.vertical, 8)
+                }.frame(maxHeight: 340)
+                Button("View full history…") { state.openHistory() }.buttonStyle(.plain).foregroundStyle(Palette.blue).font(.callout).padding(12)
             }
         }
     }
 
-    // MARK: Footer
-
     private var footer: some View {
-        HStack(spacing: 12) {
-            Button("New rule…") { state.newRule(from: nil) }
-            Button("Rules…") { state.openConfig() }
-            Button("Log") { state.openLog() }
-            Toggle("Launch at login", isOn: $state.launchAtLogin).toggleStyle(.checkbox)
+        HStack {
+            Button { state.newRule(from: nil) } label: { Label("New rule", systemImage: "plus") }
             Spacer()
-            Button("Quit") { NSApp.terminate(nil) }
-        }
-        .controlSize(.small)
+            Button("Archive…") { state.openArchive() }
+            Button("Settings…") { state.openSettings() }
+        }.controlSize(.small)
     }
 }
 
 struct InboxRow: View {
     @EnvironmentObject private var state: AppState
     let item: InboxItem
+    @State private var hovered = false
+    @State private var showingPlan = false
+
+    init(item: InboxItem, showingPlan: Bool = false) {
+        self.item = item
+        _showingPlan = State(initialValue: showingPlan)
+    }
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: item.isFolder ? "folder" : "doc")
-                .foregroundStyle(.secondary).frame(width: 14)
-            VStack(alignment: .leading, spacing: 1) {
+        HStack(alignment: .top, spacing: 8) {
+            Image(nsImage: NSWorkspace.shared.icon(forFile: item.id)).resizable().frame(width: 28, height: 28)
+            VStack(alignment: .leading, spacing: 4) {
                 Text(item.name).lineLimit(1).truncationMode(.middle)
                 HStack(spacing: 6) {
                     Text(age).foregroundStyle(.secondary)
+                    if state.inboxes.count > 1 { Text(state.inboxes[safe: item.inboxIndex]?.label ?? "").foregroundStyle(.secondary) }
                     if !item.isFolder { Text(size).foregroundStyle(.secondary) }
-                    if item.status == .settling {
-                        Text("arriving").foregroundStyle(.orange)
-                    } else if let preview = item.preview {
-                        Text(previewLabel(preview)).foregroundStyle(Color.accentColor)
-                    }
                 }
-                .font(.caption)
-            }
+                .font(.caption).lineLimit(1)
+                Button { showingPlan.toggle() } label: {
+                    HStack(alignment: .firstTextBaseline, spacing: 5) {
+                        Image(systemName: item.plan.symbol).frame(width: 13)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.plan.summary).lineLimit(2).multilineTextAlignment(.leading)
+                            if !item.plan.additionalActions.isEmpty {
+                                Text("Also: " + item.plan.additionalActions).font(.caption2)
+                            }
+                        }
+                        Image(systemName: showingPlan ? "chevron.down" : "chevron.right").font(.system(size: 8, weight: .semibold))
+                    }.font(.caption).foregroundStyle(item.plan.color).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).help(showingPlan ? "Hide the full plan" : "Show the full plan")
+                .accessibilityLabel("\(showingPlan ? "Hide" : "Show") full plan for \(item.name): \(item.plan.summary)")
+                if showingPlan {
+                    Divider().padding(.vertical, 6)
+                    FilePlanDetails(item: item, showsFilename: false).padding(.bottom, 6)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
             Spacer()
             Menu { actions } label: { Image(systemName: "ellipsis.circle") }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
         }
-        .padding(.horizontal, 12).padding(.vertical, 4)
+        .padding(.horizontal, 18).padding(.vertical, 9)
+        .background(hovered ? Color.primary.opacity(0.04) : .clear)
+        .onHover { hovered = $0 }
         .contentShape(Rectangle())
         .onTapGesture(count: 2) { state.open(item) }
         .contextMenu { actions }
+        .help(item.id)
     }
 
     @ViewBuilder private var actions: some View {
+        if !item.isFolder { Button("Review & file…") { state.reviewDocument(item.id) } }
+        if item.url.pathExtension.lowercased() == "pdf" { Button("Split scan…") { state.splitScan(item.url) } }
+        Button(showingPlan ? "Hide planned action" : "Show planned action") { showingPlan.toggle() }
         Button("New rule from this file…") { state.newRule(from: item) }
         Button("Quick Look") { state.quickLook = item.url }
         Button("Reveal in Finder") { state.reveal(item) }
@@ -204,15 +236,7 @@ struct InboxRow: View {
             }
         }
         Divider()
-        Button("Move to Trash") { state.trash(item) }
-    }
-
-    private func previewLabel(_ preview: String) -> String {
-        if preview == "?" { return "→ needs OCR" }
-        if preview.hasPrefix("learned:") { return "→ \(preview.dropFirst(8)) (learned)" }
-        if preview.hasPrefix("AI?:") { return "→ \(preview.dropFirst(4)) on request" }
-        if preview.hasPrefix("AI:") { return "→ asks \(preview.dropFirst(3))" }
-        return "→ \(preview)"
+        Button(state.simulate ? "Preview move to Trash" : "Move to Trash", role: .destructive) { state.trash(item) }
     }
 
     private var age: String {
@@ -275,7 +299,7 @@ struct ActivityRow: View {
 
     private var title: String {
         switch entry.kind {
-        case .simulated: return "would \(entry.to == nil ? (entry.message ?? "act on") : "move") \(name)"
+        case .simulated: return name
         case .error: return "failed: \(name)"
         case .skipped: return "no match: \(name)"
         case .tagged: return "tagged \(name)"
@@ -290,7 +314,8 @@ struct ActivityRow: View {
         var parts = [entry.rule]
         if let origin = entry.origin, origin != "rule" { parts.append(origin) }
         if let to = entry.to { parts.append("→ " + Paths.abbreviate(URL(fileURLWithPath: to).deletingLastPathComponent().path)) }
-        if entry.kind != .simulated, let m = entry.message { parts.append(m) }
+        if entry.kind == .simulated { parts.append(entry.to == nil ? (entry.message ?? "Preview") : "Would move") }
+        else if let m = entry.message { parts.append(m) }
         return parts.joined(separator: " · ")
     }
 
@@ -308,9 +333,9 @@ struct ActivityRow: View {
 
     private var color: Color {
         switch entry.kind {
-        case .error: return .red
+        case .error: return Palette.red
         case .simulated, .skipped: return .secondary
-        default: return .accentColor
+        default: return Palette.green
         }
     }
 }

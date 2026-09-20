@@ -10,16 +10,16 @@ struct AIModel: Decodable {
     var effort: String?
     /// The model accepts images. Screenshots and scanned PDFs are then sent as pictures instead of OCR text.
     var vision: Bool?
-    /// Remote models never run on their own unless this is set. Local ones always may.
+    /// Remote models require explicit opt-in. Local models default to automatic.
     var automatic: Bool?
 
     var isLocal: Bool {
         if provider == "apple" { return true }
         guard provider == "openai", let host = endpoint.flatMap({ URL(string: $0)?.host?.lowercased() }) else { return false }
-        return ["localhost", "127.0.0.1", "::1", "0.0.0.0"].contains(host) || host.hasSuffix(".local")
+        return ["localhost", "127.0.0.1", "::1", "[::1]"].contains(host)
     }
 
-    var runsAutomatically: Bool { isLocal || automatic == true }
+    var runsAutomatically: Bool { automatic ?? isLocal }
 
     func resolvedKey() -> String? {
         if let apiKey, !apiKey.isEmpty { return apiKey }

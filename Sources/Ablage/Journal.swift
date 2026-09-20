@@ -11,13 +11,16 @@ struct JournalEntry: Codable, Identifiable, Equatable {
     var kind: EntryKind
     var from: String
     var to: String?
+    var trashPath: String?
     var message: String?
     /// rule | manual | learned | model. Undo uses it to teach or forget.
     var origin: String?
     var previousTags: [String] = []
     var undone = false
+    var metadataEdited: Bool?
+    var previousMetadata: DocumentMetadata?
 
-    var canUndo: Bool { !undone && (kind == .moved || kind == .trashed || kind == .duplicate) }
+    var canUndo: Bool { !undone && (kind == .moved || kind == .tagged || ((kind == .trashed || kind == .duplicate) && trashPath != nil)) }
 }
 
 final class Journal {
@@ -43,6 +46,12 @@ final class Journal {
     func markUndone(_ id: UUID) {
         guard let i = entries.firstIndex(where: { $0.id == id }) else { return }
         entries[i].undone = true
+        save()
+    }
+    func recordMetadataEdit(_ id: UUID, previous: DocumentMetadata?) {
+        guard let index = entries.firstIndex(where: { $0.id == id }) else { return }
+        entries[index].metadataEdited = true
+        entries[index].previousMetadata = previous
         save()
     }
 

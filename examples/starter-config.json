@@ -1,0 +1,95 @@
+{
+  "_help": [
+    "Downloads is the default inbox. Add more folders in Settings > Inboxes.",
+    "Preview simulates actions; Review first holds arrivals until you approve a filing.",
+    "Inbox rules run before shared rules. The first matching ordinary rule wins.",
+    "The invoice and installer examples are disabled. Adapt them before enabling."
+  ],
+  "inboxes": [
+    {
+      "path": "~/Downloads",
+      "name": "Downloads",
+      "reviewFirst": true
+    }
+  ],
+  "ignore": [],
+  "settleSeconds": 3,
+  "rescanMinutes": 30,
+  "sortExistingOnRescan": false,
+  "notifications": true,
+  "ocr": true,
+  "ocrPages": 2,
+  "ocrMaxMB": 25,
+  "searchablePDFs": true,
+  "textLayerMaxPages": 60,
+  "originalsDays": 30,
+  "learning": {
+    "enabled": true,
+    "minExamples": 2,
+    "minConfidence": 0.8,
+    "minSimilarity": 0.25,
+    "fromRules": true,
+    "confirmAfterHours": 24
+  },
+  "ai": {
+    "models": {},
+    "maxChars": 3000,
+    "timeoutSeconds": 90
+  },
+  "rules": [
+    {
+      "name": "Keep marked files",
+      "match": {
+        "kind": "any",
+        "filenameRegex": "^KEEP[_ -]"
+      },
+      "action": {}
+    },
+    {
+      "name": "Screenshots",
+      "match": {
+        "extensions": [
+          "png",
+          "jpg",
+          "jpeg"
+        ],
+        "filenameRegex": "^(Screenshot|Bildschirmfoto|CleanShot|SCR-)"
+      },
+      "action": {
+        "destination": "~/Pictures/Screenshots/{year}",
+        "dateFrom": "filename"
+      }
+    },
+    {
+      "name": "Invoices by filename",
+      "enabled": false,
+      "match": {
+        "extensions": [
+          "pdf"
+        ],
+        "filenameRegex": "^(invoice|receipt)[_ -]"
+      },
+      "action": {
+        "destination": "~/Documents/Invoices/{year}",
+        "dateFrom": "filename",
+        "tags": [
+          "Invoice"
+        ]
+      }
+    },
+    {
+      "name": "Archive old installers",
+      "enabled": false,
+      "match": {
+        "extensions": [
+          "dmg",
+          "pkg"
+        ],
+        "minAgeDays": 30
+      },
+      "action": {
+        "destination": "~/Downloads/Installers"
+      }
+    }
+  ]
+}

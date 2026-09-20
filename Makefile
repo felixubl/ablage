@@ -8,10 +8,15 @@ ifeq ($(SIGN_ID),)
 SIGN_ID = -
 endif
 
-.PHONY: build app install run clean
+.PHONY: build app icons install run clean
 
 build:
 	swift build -c release
+
+icons:
+	mkdir -p dist/AppIcon.iconset
+	cat Sources/Ablage/AppMark.swift Resources/make-icon.swift | swift - dist/AppIcon.iconset
+	iconutil -c icns dist/AppIcon.iconset -o Resources/AppIcon.icns
 
 app: build
 	rm -rf $(BUNDLE)
@@ -19,13 +24,14 @@ app: build
 	cp $(BIN) $(BUNDLE)/Contents/MacOS/$(APP)
 	cp Resources/Info.plist $(BUNDLE)/Contents/Info.plist
 	cp Resources/AppIcon.icns $(BUNDLE)/Contents/Resources/AppIcon.icns
+	cp LICENSE $(BUNDLE)/Contents/Resources/LICENSE
 	codesign --force --timestamp=none --sign $(SIGN_ID) $(BUNDLE)
 
 install: app
 	pkill -x $(APP) || true
 	rm -rf /Applications/$(APP).app
 	cp -R $(BUNDLE) /Applications/$(APP).app
-	open /Applications/$(APP).app
+	open -n /Applications/$(APP).app
 
 run: app
 	open $(BUNDLE)

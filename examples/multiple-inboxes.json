@@ -1,0 +1,67 @@
+{
+  "inboxes": [
+    {
+      "path": "~/Downloads",
+      "name": "Downloads",
+      "reviewFirst": true,
+      "rules": [
+        {
+          "name": "Keep marked files",
+          "match": {
+            "kind": "any",
+            "filenameRegex": "^KEEP[_ -]"
+          },
+          "action": {}
+        },
+        {
+          "name": "Invoices by filename",
+          "enabled": true,
+          "match": {
+            "extensions": [
+              "pdf"
+            ],
+            "filenameRegex": "^(invoice|receipt)[_ -]"
+          },
+          "action": {
+            "destination": "~/Documents/Invoices/{year}",
+            "dateFrom": "filename",
+            "tags": [
+              "Invoice"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "path": "~/Desktop",
+      "name": "Desktop screenshots",
+      "reviewFirst": true,
+      "rules": [
+        {
+          "name": "Screenshots",
+          "match": {
+            "extensions": [
+              "png",
+              "jpg",
+              "jpeg"
+            ],
+            "filenameRegex": "^(Screenshot|Bildschirmfoto|CleanShot|SCR-)"
+          },
+          "action": {
+            "destination": "~/Pictures/Screenshots/{year}",
+            "dateFrom": "filename"
+          }
+        },
+        {
+          "name": "Keep other Desktop items",
+          "match": {
+            "kind": "any"
+          },
+          "action": {}
+        }
+      ]
+    }
+  ],
+  "sortExistingOnRescan": false,
+  "rules": []
+}

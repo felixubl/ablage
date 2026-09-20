@@ -1,6 +1,6 @@
 #!/bin/zsh
 # End-to-end test: runs the built binary against a scratch inbox and checks what it did.
-# Uses the "Ablage" defaults domain of the bare binary (not the app bundle's) and restores it.
+# Uses an isolated configuration and explicit simulation/pause overrides; user defaults are untouched.
 set -u
 cd "$(dirname "$0")/.."
 BIN=.build/release/Ablage
@@ -9,7 +9,8 @@ T=$(mktemp -d /tmp/ablage-e2e.XXXXXX)
 mkdir -p "$T/inbox1" "$T/inbox2" "$T/stage"
 fails=0
 check() { if eval "$2"; then echo "  ok   $1"; else echo "  FAIL $1"; fails=$((fails+1)); fi }
-cleanup() { pkill -f "$BIN" 2>/dev/null; defaults delete Ablage >/dev/null 2>&1; rm -rf "$T"; }
+APP_PID=""
+cleanup() { if [ -n "$APP_PID" ]; then kill "$APP_PID" 2>/dev/null || true; wait "$APP_PID" 2>/dev/null || true; fi; rm -rf "$T"; }
 trap cleanup EXIT
 
 cat > "$T/config.json" <<CFG
@@ -78,8 +79,8 @@ check "unrelated file not suggested"   'ABLAGE_DIR=$T $BIN suggest "$T/stage/rec
 check "validate ok"                    'ABLAGE_DIR=$T $BIN validate | grep -q "^ok"'
 
 echo "sorting"
-defaults write Ablage simulate -bool false; defaults write Ablage paused -bool false
-ABLAGE_DIR="$T" "$BIN" >"$T/app.out" 2>&1 &
+ABLAGE_SIMULATE=0 ABLAGE_PAUSED=0 ABLAGE_DIR="$T" "$BIN" >"$T/app.out" 2>&1 &
+APP_PID=$!
 sleep 2
 cp -R "$T"/stage/* "$T/inbox1/"; cp "$T/stage/notes.txt" "$T/inbox2/"
 sleep 12

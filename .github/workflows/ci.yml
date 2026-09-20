@@ -1,0 +1,31 @@
+name: macOS checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Check documentation
+        run: python3 scripts/check-docs.py
+      - name: Test
+        run: swift test
+      - name: Build app bundle
+        run: make app SIGN_ID=-
+      - name: Verify bundle
+        run: |
+          codesign --verify --strict dist/Ablage.app
+          plutil -lint dist/Ablage.app/Contents/Info.plist
+          cmp LICENSE dist/Ablage.app/Contents/Resources/LICENSE

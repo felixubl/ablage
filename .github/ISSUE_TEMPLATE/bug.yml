@@ -1,0 +1,25 @@
+name: Bug report
+description: Something did not work as expected.
+body:
+  - type: markdown
+    attributes:
+      value: Please use fictional examples and redact personal paths, document text, and credentials. Report vulnerabilities through the Security tab.
+  - type: input
+    id: versions
+    attributes:
+      label: macOS and Ablage version
+      placeholder: macOS version; Ablage version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: What happened?
+      description: Steps to reproduce, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Minimal example
+      description: A redacted rule, log excerpt, or screenshot if useful. Include whether Preview, Pause, or Review first was enabled.

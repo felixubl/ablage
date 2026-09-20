@@ -3,9 +3,32 @@ import Foundation
 /// `Ablage learn <rule> <file>`, `Ablage forget <rule> <file>`, `Ablage suggest <file>`, `Ablage examples`.
 /// The same learning the panel does from Apply rule, usable from scripts and tests.
 enum CLI {
-    static let commands = ["learn", "forget", "suggest", "examples", "add-rule", "validate", "text", "ocr-layer"]
+    static let commands = ["learn", "forget", "suggest", "examples", "add-rule", "validate", "text", "ocr-layer", "duplicates"]
 
     static func run(_ args: [String]) -> Int32 {
+        // A standalone, read-only scan must not load learners, index documents or change configuration.
+        if args.first == "duplicates" {
+            let paths = args.dropFirst().filter { !$0.hasPrefix("--") }
+            guard !paths.isEmpty, args.dropFirst().filter({ $0.hasPrefix("--") }).allSatisfy({ ["--json", "--shallow"].contains($0) }) else {
+                print("usage: Ablage duplicates [--json] [--shallow] <folder> [folder…]"); return 2
+            }
+            let report = ExactDuplicateScanner.scan(folders: paths.map { URL(fileURLWithPath: Paths.expand($0)) }, recursive: !args.contains("--shallow"))
+            if args.contains("--json") {
+                do {
+                    let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]; encoder.dateEncodingStrategy = .iso8601
+                    print(String(decoding: try encoder.encode(report), as: UTF8.self))
+                } catch { print(error.localizedDescription); return 1 }
+            } else {
+                print("\(report.files) files checked · \(report.groups.count) identical groups · \(report.extraCount) extra copies")
+                for group in report.groups {
+                    print("\n\(group.files.count) copies · \(ByteCountFormatter.string(fromByteCount: group.files.first?.size ?? 0, countStyle: .file)) each")
+                    group.files.forEach { print("  " + Paths.abbreviate($0.path)) }
+                }
+                report.issues.forEach { print("Could not check: " + $0) }
+                print("\nNo files changed. Cloud-only files skipped: \(report.cloudFiles). Repeated hard links skipped: \(report.linkedFiles).")
+            }
+            return report.issues.isEmpty ? 0 : 1
+        }
         let learner = Learner()
         learner.load()
         let config = (try? ConfigStore.load()) ?? Config()

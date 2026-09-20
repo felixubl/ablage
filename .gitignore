@@ -1,3 +1,10 @@
 .build/
 dist/
 .DS_Store
+.claude/
+.codex/
+.env
+.env.*
+*.key
+*.p12
+*.mobileprovision

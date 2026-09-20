@@ -4,16 +4,14 @@ enum Paths {
     static let home = FileManager.default.homeDirectoryForCurrentUser
 
     // ABLAGE_DIR moves config, journal and log into one folder. Used for testing.
-    private static let override = ProcessInfo.processInfo.environment["ABLAGE_DIR"].map {
-        URL(fileURLWithPath: expand($0), isDirectory: true)
-    }
+    private static var override: URL? { ProcessInfo.processInfo.environment["ABLAGE_DIR"].map { URL(fileURLWithPath: expand($0), isDirectory: true) } }
 
-    static let configDirectory = override ?? home.appendingPathComponent(".config/ablage", isDirectory: true)
-    static let configFile = configDirectory.appendingPathComponent("config.json")
-    static let supportDirectory = override ?? home.appendingPathComponent("Library/Application Support/Ablage", isDirectory: true)
-    static let journalFile = supportDirectory.appendingPathComponent("journal.json")
-    static let learnedFile = supportDirectory.appendingPathComponent("learned.json")
-    static let logFile = override?.appendingPathComponent("ablage.log") ?? home.appendingPathComponent("Library/Logs/Ablage.log")
+    static var configDirectory: URL { override ?? home.appendingPathComponent(".config/ablage", isDirectory: true) }
+    static var configFile: URL { configDirectory.appendingPathComponent("config.json") }
+    static var supportDirectory: URL { override ?? home.appendingPathComponent("Library/Application Support/Ablage", isDirectory: true) }
+    static var journalFile: URL { supportDirectory.appendingPathComponent("journal.json") }
+    static var learnedFile: URL { supportDirectory.appendingPathComponent("learned.json") }
+    static var logFile: URL { override?.appendingPathComponent("ablage.log") ?? home.appendingPathComponent("Library/Logs/Ablage.log") }
     static let trash = home.appendingPathComponent(".Trash", isDirectory: true)
 
     static func expand(_ path: String) -> String { (path as NSString).expandingTildeInPath }
@@ -22,9 +20,12 @@ enum Paths {
 
 struct InboxConfig: Decodable {
     var path: String
+    var name: String?
+    var enabled: Bool?
     var ignore: [String]?
     var rules: [Rule]?
     var sortExistingOnRescan: Bool?
+    var reviewFirst: Bool?
 }
 
 struct LearnConfig: Decodable {
@@ -71,6 +72,9 @@ struct Config: Decodable {
     var searchablePDFs = true
     var textLayerMaxPages = 60
     var originalsDays = 30
+    var keepOriginalsForever = false
+    var archiveFolders: [String] = []
+    var mailAccounts: [MailAccount] = []
     var ai = AIConfig()
     var learning = LearnConfig()
     var rules: [Rule] = []
@@ -82,7 +86,7 @@ struct Config: Decodable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case inbox, inboxes, ignore, settleSeconds, rescanMinutes, sortExistingOnRescan, notifications, ocr, ocrPages, ocrMaxMB, searchablePDFs, textLayerMaxPages, originalsDays, ai, learning, rules
+        case inbox, inboxes, ignore, settleSeconds, rescanMinutes, sortExistingOnRescan, notifications, ocr, ocrPages, ocrMaxMB, searchablePDFs, textLayerMaxPages, originalsDays, keepOriginalsForever, archiveFolders, mailAccounts, ai, learning, rules
     }
 
     init() {}
@@ -102,6 +106,9 @@ struct Config: Decodable {
         searchablePDFs = try c.decodeIfPresent(Bool.self, forKey: .searchablePDFs) ?? searchablePDFs
         textLayerMaxPages = try c.decodeIfPresent(Int.self, forKey: .textLayerMaxPages) ?? textLayerMaxPages
         originalsDays = try c.decodeIfPresent(Int.self, forKey: .originalsDays) ?? originalsDays
+        keepOriginalsForever = try c.decodeIfPresent(Bool.self, forKey: .keepOriginalsForever) ?? false
+        archiveFolders = try c.decodeIfPresent([String].self, forKey: .archiveFolders) ?? []
+        mailAccounts = try c.decodeIfPresent([MailAccount].self, forKey: .mailAccounts) ?? []
         ai = try c.decodeIfPresent(AIConfig.self, forKey: .ai) ?? ai
         learning = try c.decodeIfPresent(LearnConfig.self, forKey: .learning) ?? learning
         rules = try c.decodeIfPresent([Rule].self, forKey: .rules) ?? rules
@@ -109,11 +116,11 @@ struct Config: Decodable {
 }
 
 enum ConfigStore {
-    static func ensureDefault() throws {
+    static func ensureDefault(at url: URL = Paths.configFile) throws {
         let fm = FileManager.default
-        guard !fm.fileExists(atPath: Paths.configFile.path) else { return }
-        try fm.createDirectory(at: Paths.configDirectory, withIntermediateDirectories: true)
-        try DefaultConfig.json.write(to: Paths.configFile, atomically: true, encoding: .utf8)
+        guard !fm.fileExists(atPath: url.path) else { return }
+        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try DefaultConfig.json.write(to: url, atomically: true, encoding: .utf8)
     }
 
     static func load() throws -> Config {
@@ -155,6 +162,10 @@ extension ConfigStore {
         var cut = close
         while cut > text.index(after: open), text[text.index(before: cut)].isWhitespace { cut = text.index(before: cut) }
         text.replaceSubrange(cut..<close, with: (isEmpty ? "\n" : ",\n") + indented + "\n  ")
+        let config = try JSONDecoder().decode(Config.self, from: Data(text.utf8))
+        let issues = problems(in: config)
+        guard issues.isEmpty else { throw ConfigError(message: issues.joined(separator: "\n")) }
+        try Data(contentsOf: Paths.configFile).write(to: Paths.configFile.deletingPathExtension().appendingPathExtension("previous.json"), options: .atomic)
         try text.write(to: Paths.configFile, atomically: true, encoding: .utf8)
     }
 
@@ -231,8 +242,32 @@ extension ConfigStore {
     /// Mistakes that would otherwise fail silently: bad regexes, rules naming models that do not exist.
     static func problems(in config: Config) -> [String] {
         var out: [String] = []
+        var paths = Set<String>()
+        for inbox in config.resolvedInboxes {
+            let expanded = Paths.expand(inbox.path)
+            if !expanded.hasPrefix("/") { out.append("Inbox paths must be absolute or start with ~: \(inbox.path)") }
+            let path = URL(fileURLWithPath: expanded).standardizedFileURL.resolvingSymlinksInPath().path
+            if !paths.insert(path).inserted { out.append("This inbox is listed more than once: \(inbox.path)") }
+        }
+        if config.settleSeconds < 0.5 { out.append("settleSeconds must be at least 0.5") }
+        if config.rescanMinutes < 0 { out.append("rescanMinutes cannot be negative") }
+        if config.ocrPages < 1 || config.textLayerMaxPages < 1 || config.ocrMaxMB <= 0 || config.originalsDays < 1 {
+            out.append("OCR limits and original retention must be greater than zero")
+        }
         let rules = config.rules + config.resolvedInboxes.flatMap { $0.rules ?? [] }
+        for path in config.archiveFolders where !Paths.expand(path).hasPrefix("/") { out.append("Archive folders must be absolute paths: \(path)") }
+        var accountIDs = Set<String>()
+        for account in config.mailAccounts {
+            if !accountIDs.insert(account.id).inserted { out.append("Email accounts must have distinct identifiers.") }
+            if let problem = account.problem { out.append(problem) }
+            if !config.resolvedInboxes.contains(where: { FileIdentity.same(URL(fileURLWithPath: Paths.expand($0.path)), URL(fileURLWithPath: Paths.expand(account.inbox))) }) {
+                out.append("Email account \(account.name) needs one of your inbox folders as its destination.")
+            }
+        }
         for rule in rules {
+            if rule.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { out.append("Every rule needs a name") }
+            if let days = rule.match.minAgeDays, days < 0 { out.append("rule \"\(rule.name)\": minimum age cannot be negative") }
+            if let min = rule.match.minSizeMB, let max = rule.match.maxSizeMB, min > max { out.append("rule \"\(rule.name)\": minimum size exceeds maximum size") }
             for (label, pattern) in [("filenameRegex", rule.match.filenameRegex), ("contentRegex", rule.match.contentRegex)] {
                 guard let pattern, !pattern.isEmpty else { continue }
                 if (try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])) == nil {

@@ -39,6 +39,15 @@ final class AppState: ObservableObject {
         launchAtLogin = LaunchAtLogin.isEnabled
     }
 
+    #if DEBUG
+    init(preview snapshot: Snapshot) {
+        simulate = true
+        paused = false
+        launchAtLogin = false
+        apply(snapshot)
+    }
+    #endif
+
     func start() {
         engine.onUpdate = { [weak self] snapshot in
             Task { @MainActor in self?.apply(snapshot) }
@@ -78,7 +87,13 @@ final class AppState: ObservableObject {
     func apply(ruleNamed name: String, to items: [InboxItem]) { engine.apply(ruleNamed: name, paths: items.map(\.id)) }
     func sort(_ items: [InboxItem]) { engine.sort(paths: items.map(\.id)) }
     func trash(_ items: [InboxItem]) { engine.trash(paths: items.map(\.id)) }
+    func openSettings(section: String? = nil) { SettingsController.shared.show(state: self, section: section) }
+    func openHistory() { HistoryController.shared.show(state: self) }
     func openReview() { ReviewController.shared.show(state: self) }
+    func openArchive() { ArchiveController.shared.show(state: self) }
+    func openDuplicates() { ExactDuplicateController.shared.show(state: self) }
+    func reviewDocument(_ path: String) { DocumentReviewController.shared.show(path: path, state: self) }
+    func splitScan(_ url: URL) { ScanSplitController.shared.show(url: url) }
     func ask(model: String, _ item: InboxItem) { engine.ask(model: model, path: item.id) }
     func trash(_ item: InboxItem) { engine.trash(path: item.id) }
     func undo(_ entry: JournalEntry) { engine.undo(entry.id) }
@@ -101,22 +116,30 @@ final class AppState: ObservableObject {
             var draft = RuleDraft()
             draft.extensions = facts?.ext ?? ""
             draft.source = facts?.host ?? ""
+            draft.inboxPath = self?.inboxes[safe: item.inboxIndex]?.path
             self?.present(draft, excerpt: text, item: item)
         }
     }
 
     private func present(_ draft: RuleDraft, excerpt: String, item: InboxItem?) {
-        RuleEditorController.shared.show(draft: draft, excerpt: excerpt, fileName: item?.name) { [weak self] draft in
+        RuleEditorController.shared.show(draft: draft, excerpt: excerpt, fileName: item?.name, availableModels: aiModels) { [weak self] draft in
             do {
-                try ConfigStore.appendRule(draft.json)
+                var document = try ConfigDocument.load()
+                guard let rule = try JSONSerialization.jsonObject(with: Data(draft.json.utf8)) as? [String: Any] else { return false }
+                let scope = draft.localOnly ? document.inboxes.firstIndex { Paths.expand($0["path"] as? String ?? "") == draft.inboxPath } : nil
+                var rules = document.rules(in: scope)
+                rules.append(rule)
+                document.setRules(rules, in: scope)
+                try document.save()
             } catch {
                 let alert = NSAlert()
                 alert.messageText = "Could not save the rule"
                 alert.informativeText = error.localizedDescription
                 alert.runModal()
-                return
+                return false
             }
             if draft.applyNow, let item { self?.engine.apply(ruleNamed: draft.name.trimmingCharacters(in: .whitespaces), to: item.id) }
+            return true
         }
     }
     func openConfig() { NSWorkspace.shared.open(Paths.configFile) }
