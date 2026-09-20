@@ -23,7 +23,14 @@ retain folder permissions across rebuilds. Ad-hoc builds may need permission aga
 These are local development builds. The project does not yet provide a Developer ID
 signed and notarized download. Do not commit signing certificates or credentials.
 
+The [Homebrew formula](https://github.com/felixubl/homebrew-tap/blob/main/Formula/ablage.rb)
+builds a tagged source release and manages the app in Homebrew's Cellar. Package checks
+and update instructions live in that tap repository.
+
 ## Test
+
+The test suite needs full Xcode for XCTest. Building and installing the app only needs
+Command Line Tools.
 
 ```sh
 swift test

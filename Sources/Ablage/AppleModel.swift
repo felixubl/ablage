@@ -4,16 +4,33 @@ import Foundation
 import FoundationModels
 
 @available(macOS 26.0, *)
-@Generable
-struct AppleClassification {
-    @Guide(description: "Number of the category that fits best, 0 when none fits")
+struct AppleClassification: Generable {
     var category: Int
-    @Guide(description: "Who issued the document: company, authority or person, kept short")
     var correspondent: String
-    @Guide(description: "Subject of the document in 2 to 6 words")
     var title: String
-    @Guide(description: "Document date as YYYY-MM-DD, empty when unknown")
     var date: String
+
+    // Declare the schema explicitly: Command Line Tools ship the framework but may
+    // omit Xcode's @Generable compiler plugin. Guided generation still uses this schema.
+    static var generationSchema: GenerationSchema {
+        GenerationSchema(type: Self.self, properties: [
+            .init(name: "category", description: "Number of the category that fits best, 0 when none fits", type: Int.self),
+            .init(name: "correspondent", description: "Who issued the document: company, authority or person, kept short", type: String.self),
+            .init(name: "title", description: "Subject of the document in 2 to 6 words", type: String.self),
+            .init(name: "date", description: "Document date as YYYY-MM-DD, empty when unknown", type: String.self)
+        ])
+    }
+
+    init(_ content: GeneratedContent) throws {
+        category = try content.value(Int.self, forProperty: "category")
+        correspondent = try content.value(String.self, forProperty: "correspondent")
+        title = try content.value(String.self, forProperty: "title")
+        date = try content.value(String.self, forProperty: "date")
+    }
+
+    var generatedContent: GeneratedContent {
+        GeneratedContent(properties: ["category": category, "correspondent": correspondent, "title": title, "date": date])
+    }
 }
 #endif
 

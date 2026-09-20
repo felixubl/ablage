@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.4 — 2026-09-20
+
+- Homebrew installation through `felixubl/tap/ablage`, with an `ablage` launcher and CLI.
+- Build Apple Intelligence support with Command Line Tools that omit Xcode's model macros.
+- Installation, update, and uninstall instructions for Homebrew users.
+
 ## 0.3.3 — 2026-09-20
 
 First public source release, under the MIT license.

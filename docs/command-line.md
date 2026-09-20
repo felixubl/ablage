@@ -7,6 +7,9 @@ convenience:
 ABLAGE=/Applications/Ablage.app/Contents/MacOS/Ablage
 ```
 
+With a Homebrew installation, use `ABLAGE=ablage` instead. Running `ablage` without
+arguments opens the menu bar app.
+
 ## Read-only commands
 
 ```sh

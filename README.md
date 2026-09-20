@@ -31,6 +31,19 @@ Requires **macOS 14 or later** and Xcode Command Line Tools. To use Apple Intell
 build with the macOS 26 SDK and run on a supported Mac with Apple Intelligence enabled.
 The rest of Ablage works without it.
 
+### Homebrew
+
+```sh
+brew install felixubl/tap/ablage
+ablage
+```
+
+This builds the tagged release from source. `ablage` opens the menu bar app; the app
+bundle is managed by Homebrew. Quit Ablage before updating with `brew update` and
+`brew upgrade felixubl/tap/ablage`, then reopen it. [Homebrew details](https://github.com/felixubl/homebrew-tap#install-ablage)
+
+### Manually
+
 ```sh
 xcode-select --install  # Skip if already installed.
 git clone https://github.com/felixubl/ablage.git

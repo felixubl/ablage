@@ -65,7 +65,8 @@ Undo does not reverse post-filing scripts or replace a backup.
 ## Uninstall
 
 Quit Ablage and remove `/Applications/Ablage.app`. Your filed documents remain in their
-folders. Keep the configuration and Application Support folder if you may reinstall;
+folders. For a Homebrew installation, use `brew uninstall felixubl/tap/ablage` instead.
+Keep the configuration and Application Support folder if you may reinstall;
 remove them separately only if you no longer need their history, metadata, or originals.
 Remove saved email credentials through Keychain Access if desired. Disabling launch at
 login before uninstalling removes Ablage's login item.

@@ -5,7 +5,8 @@ import PDFKit
 import Vision
 
 /// Gives a scanned PDF an invisible text layer, so Spotlight, Preview and Ablage's own rules
-/// can read it. The page images are re-embedded untouched; only text is added on top.
+/// can read it. Pages are drawn into a new PDF; interactive features may not survive.
+/// The filing engine keeps the pre-rewrite file for Undo.
 enum SearchablePDF {
     struct Failure: LocalizedError {
         let message: String
