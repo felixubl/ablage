@@ -64,7 +64,14 @@ final class EngineIntegrationTests: XCTestCase {
         try waitFor { snapshots.get()?.items.first(where: { $0.id == scan.path })?.plan.state == .needsOCR }
         setenv("ABLAGE_PAUSED", "0", 1)
         engine.refreshPreviews()
-        try waitFor { snapshots.get()?.items.first(where: { $0.id == scan.path })?.plan.rule == "Scanned invoices" }
+        // A clean macOS runner may need to initialize Vision's recognition models.
+        // Surface recognition errors directly instead of reporting a generic timeout.
+        try waitFor(timeout: 30) {
+            guard let plan = snapshots.get()?.items.first(where: { $0.id == scan.path })?.plan else { return false }
+            return plan.rule == "Scanned invoices" || plan.state == .textFailed
+        }
+        let recognizedPlan = try XCTUnwrap(snapshots.get()?.items.first(where: { $0.id == scan.path })?.plan)
+        XCTAssertEqual(recognizedPlan.rule, "Scanned invoices", recognizedPlan.fullDescription)
         XCTAssertEqual(Hashing.digest(scan), scanDigest, "Background OCR must not rewrite, file or trash a scan")
         XCTAssertFalse(snapshots.get()?.journal.contains { $0.from == scan.path } ?? true)
         try waitFor { snapshots.get()?.items.first(where: { $0.id == broken.path })?.plan.state == .textFailed }
@@ -191,8 +198,8 @@ final class EngineIntegrationTests: XCTestCase {
         XCTAssertTrue(CGImageDestinationFinalize(destination))
     }
 
-    private func waitFor(_ predicate: () -> Bool, file: StaticString = #filePath, line: UInt = #line) throws {
-        let deadline = Date().addingTimeInterval(8)
+    private func waitFor(timeout: TimeInterval = 8, _ predicate: () -> Bool, file: StaticString = #filePath, line: UInt = #line) throws {
+        let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if predicate() { return }
             Thread.sleep(forTimeInterval: 0.03)
