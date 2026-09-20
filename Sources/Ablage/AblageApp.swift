@@ -30,11 +30,9 @@ struct MenuBarLabel: View {
     let count: Int
     let paused: Bool
 
+    // Icon only: a full menu bar on a notched MacBook hides wide items behind the notch.
     var body: some View {
-        HStack(spacing: 2) {
-            Image(systemName: paused ? "pause.circle" : (count == 0 ? "tray" : "tray.full"))
-            if count > 0 { Text("\(count)").monospacedDigit() }
-        }
+        Image(systemName: paused ? "pause.circle" : (count == 0 ? "tray" : "tray.full"))
     }
 }
 
